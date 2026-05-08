@@ -126,6 +126,8 @@ PROXY_ENV_KEYS = (
 )
 SHELL_COMMANDS = {"bash", "fish", "sh", "zsh"}
 BRAILLE_SPINNER_CHARS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+CLAUDE_READY_TITLE = "✳ Claude Code"
+CLAUDE_BUSY_TITLE_CHARS = f"{BRAILLE_SPINNER_CHARS}⠐⠂·✶✻✽✢"
 
 
 def _truthy_runtime_flag(value: object) -> bool:
@@ -204,7 +206,23 @@ def worker_state_is_prelaunch_active(source: Mapping[str, object] | object | Non
     if statuses & TERMINAL_WORKER_RESULT_STATUSES:
         return False
     return bool(statuses & PRELAUNCH_ACTIVE_RESULT_STATUSES)
+
+
 BRAILLE_SPINNER_PREFIX_RE = re.compile(rf"^[{BRAILLE_SPINNER_CHARS}]\s+")
+CLAUDE_BUSY_TITLE_PREFIX_RE = re.compile(rf"^[{re.escape(CLAUDE_BUSY_TITLE_CHARS)}]\s+")
+CLAUDE_READY_PATTERNS = (
+    r"^\s*❯\s*$",
+)
+CLAUDE_BUSY_PATTERNS = (
+    r"\bNesting…",
+    r"\bNesting\.\.\.",
+    r"\bRunning…",
+    r"\bRunning\.\.\.",
+    r"\bthinking with\b",
+    r"\besc to interrupt\b",
+    r"⎿\s+Running",
+    r"^\s*(?:·|✶|✻|✽|✢|✳)\s+\S.*(?:thinking|tokens|Nesting)",
+)
 CODEX_TRUST_PROMPT_PATTERNS = (
     r"allow Codex to work in this folder",
     r"Do you trust the contents of this directory\?",
@@ -313,6 +331,20 @@ def _codex_effective_recent_surface(text: str, *, max_lines: int = 120) -> str:
             break
     start_index = prompt_index if prompt_index >= 0 else max(0, footer_index - 20)
     return "\n".join(lines[start_index:])
+
+
+def _claude_title_indicates_ready(pane_title: str) -> bool:
+    title = str(pane_title or "").strip()
+    return title == CLAUDE_READY_TITLE or title.startswith(f"{CLAUDE_READY_TITLE} ")
+
+
+def _claude_title_indicates_busy(pane_title: str) -> bool:
+    title = str(pane_title or "").strip()
+    if not title or _claude_title_indicates_ready(title):
+        return False
+    return bool(CLAUDE_BUSY_TITLE_PREFIX_RE.match(title))
+
+
 GEMINI_FOOTER_PATTERNS = (
     r"^\?\s+for shortcuts$",
     r"^YOLO\b",
@@ -1812,13 +1844,26 @@ class CodexOutputDetector(BaseOutputDetector):
 
 class ClaudeOutputDetector(BaseOutputDetector):
     def classify_agent_state(self, observation: WorkerObservation) -> AgentRuntimeState:
+        visible_text = self.current_visible_text(observation)
+        recent_log = self.recent_log_text(observation)
         text = self.observation_text(observation)
-        base_state = super().classify_agent_state(observation)
-        if base_state != AgentRuntimeState.BUSY:
-            return base_state
-        if re.search(r"^\s*❯", text, re.MULTILINE):
+        if observation.pane_dead:
+            return AgentRuntimeState.DEAD
+        if not observation.session_exists:
+            return AgentRuntimeState.DEAD
+        if observation.current_command in SHELL_COMMANDS:
+            return AgentRuntimeState.DEAD
+        if _claude_title_indicates_busy(observation.pane_title):
+            return AgentRuntimeState.BUSY
+        if self._contains_any(visible_text or recent_log or text, CLAUDE_BUSY_PATTERNS):
+            return AgentRuntimeState.BUSY
+        if _claude_title_indicates_ready(observation.pane_title):
             return AgentRuntimeState.READY
-        return AgentRuntimeState.BUSY
+        if self._has_turn_token(text):
+            return AgentRuntimeState.READY
+        if self._contains_any(visible_text or recent_log or text, CLAUDE_READY_PATTERNS):
+            return AgentRuntimeState.READY
+        return AgentRuntimeState.BUSY if observation.current_command else AgentRuntimeState.STARTING
 
     def extract_last_message(self, output: str) -> str:
         clean_output = clean_ansi(output)
@@ -2028,7 +2073,7 @@ class AgentRunConfig:
     def expected_current_commands(self) -> tuple[str, ...]:
         return {
             Vendor.CODEX: ("codex", "node"),
-            Vendor.CLAUDE: ("claude", "node"),
+            Vendor.CLAUDE: ("claude", "claude.exe", "node"),
             Vendor.GEMINI: ("gemini", "node"),
             Vendor.OPENCODE: ("opencode", "node"),
         }[self.vendor]
@@ -2769,18 +2814,25 @@ class TmuxBatchWorker:
         return observation
 
     def _should_capture_visible_for_passive_health(self, observation: WorkerObservation) -> bool:
-        if self.config.vendor != Vendor.CODEX:
-            return False
         if not self.agent_started or not observation.session_exists or observation.pane_dead:
             return False
         current_command = observation.current_command or self.current_command
         if not self._agent_running(current_command):
             return False
-        if self._title_indicates_ready(observation.pane_title):
-            return False
-        if self._title_indicates_busy(observation.pane_title):
-            return True
-        return self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
+        if self.config.vendor == Vendor.CODEX:
+            if self._title_indicates_ready(observation.pane_title):
+                return False
+            if self._title_indicates_busy(observation.pane_title):
+                return True
+            return self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
+        if self.config.vendor == Vendor.CLAUDE:
+            if self._title_indicates_ready(observation.pane_title):
+                return False
+            title = str(observation.pane_title or "").strip()
+            if title.startswith("✳ "):
+                return True
+            return self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
+        return False
 
     def _build_passive_health_snapshot(self, observation: WorkerObservation | None = None) -> WorkerHealthSnapshot:
         passive_observation = observation or self._capture_passive_observation()
@@ -4255,7 +4307,7 @@ class TmuxBatchWorker:
         if self.config.vendor == Vendor.CODEX:
             return title in self._codex_title_candidates()
         if self.config.vendor == Vendor.CLAUDE:
-            return title.startswith("✳ ")
+            return _claude_title_indicates_ready(title)
         if self.config.vendor == Vendor.GEMINI:
             return title.startswith("◇") and "Ready" in title
         return False
@@ -4269,7 +4321,7 @@ class TmuxBatchWorker:
                 title.endswith(candidate) for candidate in self._codex_title_candidates()
             )
         if self.config.vendor == Vendor.CLAUDE:
-            return bool(BRAILLE_SPINNER_PREFIX_RE.match(title))
+            return _claude_title_indicates_busy(title)
         if self.config.vendor == Vendor.GEMINI:
             return title.startswith("✦") and "Working" in title
         return False
@@ -4462,7 +4514,9 @@ class TmuxBatchWorker:
                 return False
             return any(re.search(pattern, recent_output, re.IGNORECASE | re.MULTILINE) for pattern in CODEX_READY_PATTERNS)
         if self.config.vendor == Vendor.CLAUDE:
-            return bool(re.search(r"^\s*❯", recent_output, re.MULTILINE))
+            if any(re.search(pattern, recent_output, re.IGNORECASE | re.MULTILINE) for pattern in CLAUDE_BUSY_PATTERNS):
+                return False
+            return any(re.search(pattern, recent_output, re.IGNORECASE | re.MULTILINE) for pattern in CLAUDE_READY_PATTERNS)
         if self.config.vendor == Vendor.GEMINI:
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in GEMINI_TRUST_PROMPT_PATTERNS + GEMINI_NOT_READY_PATTERNS):
                 return False

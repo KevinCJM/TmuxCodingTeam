@@ -8,6 +8,7 @@ export type FileSnapshot = {
 
 export type WorkerSnapshot = {
   index?: number
+  workerId?: string
   workDir: string
   sessionName: string
   status: string

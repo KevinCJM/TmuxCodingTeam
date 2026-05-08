@@ -310,22 +310,46 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertEqual(replace_calls, [main])
         self.assertEqual(main.worker.ensure_calls, 1)
 
-    def test_run_main_phase_with_death_handling_does_not_replace_main_for_reviewer_ready_death(self):
+    def test_run_main_phase_with_death_handling_ignores_reviewer_ready_death(self):
         main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
         reviewer = SimpleNamespace(worker=_ReadyDeathWorker(session_name="审核员-地巧星"), reviewer_name="审核员-地巧星")
         replace_calls: list[object] = []
 
-        with self.assertRaisesRegex(RuntimeError, "审核员-地巧星"):
-            run_main_phase_with_death_handling(
-                main,
-                reviewers=[reviewer],
-                run_phase=lambda owner: owner,
-                replace_dead_main_owner=lambda owner: replace_calls.append(owner) or owner,
-                main_label="开发工程师",
-                reviewer_label_getter=lambda item, _index: item.reviewer_name,
-            )
+        result, reviewers, current_main = run_main_phase_with_death_handling(
+            main,
+            reviewers=[reviewer],
+            run_phase=lambda owner: owner,
+            replace_dead_main_owner=lambda owner: replace_calls.append(owner) or owner,
+            main_label="开发工程师",
+            reviewer_label_getter=lambda item, _index: item.reviewer_name,
+        )
 
+        self.assertIs(result, main)
+        self.assertEqual(reviewers, [reviewer])
+        self.assertIs(current_main, main)
         self.assertEqual(replace_calls, [])
+        self.assertEqual(reviewer.worker.ensure_calls, 0)
+
+    def test_run_main_phase_with_death_handling_drops_dead_reviewer_without_blocking_busy_reviewer(self):
+        main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
+        dead = SimpleNamespace(worker=_DeathAwareFakeWorker("DEAD", launched=True), reviewer_name="dead")
+        busy = SimpleNamespace(worker=_DeathAwareFakeWorker("BUSY", launched=True), reviewer_name="busy")
+        notices: list[str] = []
+
+        result, reviewers, current_main = run_main_phase_with_death_handling(
+            main,
+            reviewers=[dead, busy],
+            run_phase=lambda owner: owner,
+            replace_dead_main_owner=lambda owner: owner,
+            reviewer_label_getter=lambda item, _index: item.reviewer_name,
+            notify=notices.append,
+        )
+
+        self.assertIs(result, main)
+        self.assertIs(current_main, main)
+        self.assertEqual(reviewers, [busy])
+        self.assertEqual(busy.worker.ensure_calls, 0)
+        self.assertEqual(notices, ["dead 已死亡，后续将忽略该审核智能体。"])
 
     def test_run_reviewer_phase_with_death_handling_replaces_dead_reviewer(self):
         main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))

@@ -495,6 +495,115 @@ s
                         self.assertEqual(worker.config.proxy_url, "http://127.0.0.1:10900")
                         self.assertEqual(build_proxy_env(worker.config.proxy_url)["HTTP_PROXY"], "http://127.0.0.1:10900")
 
+    def test_claude_busy_surface_overrides_prompt_and_stale_ready_markers(self):
+        busy_visible = """
+❯ 请执行这个命令并告诉我结果: sleep 8 && echo state-test-done
+
+⏺ Bash(sleep 8 && echo state-test-done)
+  ⎿  Running…
+
+✶ Nesting… (8s · ↓ 134 tokens · thinking with high effort)
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt
+""".strip()
+        detector_state = ClaudeOutputDetector().classify_agent_state(
+            WorkerObservation(
+                visible_text=busy_visible,
+                raw_log_delta="",
+                raw_log_tail="old ready prompt\n❯\n[[ACX_TURN:old:DONE]]",
+                current_command="claude.exe",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-24T00:00:00",
+                pane_title="",
+            )
+        )
+        self.assertEqual(detector_state, AgentRuntimeState.BUSY)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="claude-busy-state-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="claude", model="sonnet"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            observation = WorkerObservation(
+                visible_text=busy_visible,
+                raw_log_delta="",
+                raw_log_tail="old ready prompt\n❯",
+                current_command="claude.exe",
+                current_path=tmp_dir,
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-24T00:00:01",
+                pane_title="⠐ Execute test command with sleep delay",
+            )
+            self.assertEqual(worker.get_agent_state(observation), AgentRuntimeState.BUSY)
+            self.assertFalse(worker._visible_indicates_agent_ready(busy_visible))  # noqa: SLF001
+
+            star_busy_observation = WorkerObservation(
+                visible_text=busy_visible,
+                raw_log_delta="",
+                raw_log_tail="old ready prompt\n❯",
+                current_command="claude.exe",
+                current_path=tmp_dir,
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-24T00:00:02",
+                pane_title="✳ Nesting…",
+            )
+            self.assertEqual(worker.get_agent_state(star_busy_observation), AgentRuntimeState.BUSY)
+
+            ready_observation = WorkerObservation(
+                visible_text="❯",
+                raw_log_delta="",
+                raw_log_tail="❯",
+                current_command="claude.exe",
+                current_path=tmp_dir,
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-24T00:00:03",
+                pane_title="✳ Claude Code",
+            )
+            self.assertEqual(worker.get_agent_state(ready_observation), AgentRuntimeState.READY)
+
+            completed_ready_surface = """
+⏺ Bash(sleep 2 && echo claude-ready-regression-done)
+  ⎿  claude-ready-regression-done
+
+⏺ 命令执行成功，输出为：claude-ready-regression-done
+
+✻ Brewed for 20s
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+""".strip()
+            completed_ready_observation = WorkerObservation(
+                visible_text=completed_ready_surface,
+                raw_log_delta="",
+                raw_log_tail="",
+                current_command="claude.exe",
+                current_path=tmp_dir,
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-24T00:00:04",
+                pane_title="✳ Execute command and report results",
+            )
+            self.assertEqual(worker.get_agent_state(completed_ready_observation), AgentRuntimeState.READY)
+
     def test_codex_title_detection_accepts_work_dir_basename(self):
         class CodexStateWorker(TmuxBatchWorker):
             def target_exists(self, target=None):
@@ -7316,6 +7425,72 @@ Do you trust the files in this folder?
         self.assertEqual(state["agent_state"], AgentRuntimeState.READY.value)
         self.assertEqual(worker.capture_calls, 1)
         self.assertEqual(worker.last_log_offset, 77)
+
+    def test_claude_passive_health_uses_visible_prompt_when_ready_title_is_task_name(self):
+        class TaskTitleClaudeWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.capture_calls = 0
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                self.capture_calls += 1
+                return """
+⏺ Bash(sleep 2 && echo claude-ready-regression-done)
+  ⎿  claude-ready-regression-done
+
+⏺ 命令执行成功，输出为：claude-ready-regression-done
+
+✻ Brewed for 20s
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+""".strip()
+
+            def pane_current_command(self):
+                return "claude.exe"
+
+            def pane_current_path(self):
+                return str(self.work_dir)
+
+            def pane_title(self):
+                return "✳ Execute command and report results"
+
+            def pane_dead(self):
+                return False
+
+            def tail_raw_log(self, *, tail_bytes=24000):
+                raise AssertionError("passive Claude ready recovery should not consume raw log")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TaskTitleClaudeWorker(
+                worker_id="claude-passive-task-title-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="claude", model="sonnet"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.current_command = "claude.exe"
+            worker.last_pane_title = "✳ Execute command and report results"
+            worker.last_log_offset = 88
+            worker._write_state(WorkerStatus.READY, note="seed")
+
+            snapshot = worker.refresh_health()
+            state = worker.read_state()
+
+        self.assertEqual(snapshot.agent_state, AgentRuntimeState.READY.value)
+        self.assertEqual(state["agent_state"], AgentRuntimeState.READY.value)
+        self.assertEqual(worker.capture_calls, 1)
+        self.assertEqual(worker.last_log_offset, 88)
 
     def test_passive_health_snapshot_maps_busy_and_dead_agent_states(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

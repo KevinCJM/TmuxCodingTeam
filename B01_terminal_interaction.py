@@ -20,6 +20,7 @@ from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A01_Routing_LayerPlanning import (
     CliRequest,
     DEFAULT_MODEL_BY_VENDOR,
+    EMPTY_PROJECT_ROUTING_SKIP_MESSAGE,
     build_parser,
     determine_exit_code,
     display_status_label,
@@ -60,11 +61,13 @@ from T03_agent_init_workflow import (
     kill_run_tmux_sessions,
     load_existing_run,
     missing_routing_layer_files,
+    project_has_business_files,
     prepare_live_workers,
     required_routing_layer_paths,
     resolve_existing_directory,
     resolve_target_selection,
     run_directory_initialization_with_worker,
+    should_skip_routing_init_for_empty_project,
 )
 
 
@@ -198,9 +201,17 @@ def collect_b01_request(args: argparse.Namespace) -> CliRequest:
         if args.project_dir
         else prompt_project_dir("")
     )
+    target_dirs = tuple(args.target_dir or ())
     project_missing_files = tuple(missing_routing_layer_files(project_dir))
+    explicit_run_init_yes = bool(args.run_init and normalize_run_init_choice(args.run_init))
+    should_skip_empty_project = should_skip_routing_init_for_empty_project(
+        project_dir,
+        project_missing_files=project_missing_files,
+        target_dirs=target_dirs,
+        explicit_run_init_yes=explicit_run_init_yes,
+    )
     if project_missing_files:
-        requested_run_init = True
+        requested_run_init = not should_skip_empty_project
     else:
         requested_run_init = (
             normalize_run_init_choice(args.run_init)
@@ -208,13 +219,12 @@ def collect_b01_request(args: argparse.Namespace) -> CliRequest:
             else (True if parameter_mode else prompt_yes_no("是否需要生成项目路由层", True))
         )
     run_init = requested_run_init
-    if project_missing_files and (
+    if project_missing_files and not should_skip_empty_project and (
         (args.run_init and not normalize_run_init_choice(args.run_init))
         or (not args.run_init and not parameter_mode)
     ):
         message("当前项目路由层文件缺失, 强制执行路由初始化")
 
-    target_dirs = tuple(args.target_dir or ())
     if run_init and not args.target_dir and not parameter_mode:
         target_dirs = prompt_target_dirs(())
     if not run_init:
@@ -627,6 +637,7 @@ class AgentInitControlCenter:
                     "workflow_stage": row.workflow_stage,
                     "agent_state": row.agent_state,
                     "health_status": row.health_status,
+                    "current_task_runtime_status": str(getattr(entry, "current_task_runtime_status", "") or "").strip(),
                     "retry_count": row.retry_count,
                     "session_exists": row.session_exists,
                     "note": row.note,
@@ -636,6 +647,7 @@ class AgentInitControlCenter:
                     "question_path": str(artifact_bundle.get("question_path", "")).strip(),
                     "answer_path": str(artifact_bundle.get("answer_path", "")).strip(),
                     "artifact_paths": artifact_paths,
+                    "last_heartbeat_at": str(getattr(entry, "last_heartbeat_at", "") or "").strip(),
                 }
             )
         return snapshots
@@ -994,7 +1006,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not selection.should_run:
         from A01_Routing_LayerPlanning import render_requirements_stage_placeholder
 
-        message("当前项目路由层已完备，跳过路由初始化。")
+        if selection.project_missing_files and not project_has_business_files(selection.project_dir):
+            message(EMPTY_PROJECT_ROUTING_SKIP_MESSAGE)
+        else:
+            message("当前项目路由层已完备，跳过路由初始化。")
         message(render_requirements_stage_placeholder([]))
         return 0
 

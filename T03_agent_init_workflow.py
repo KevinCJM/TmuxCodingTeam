@@ -60,6 +60,44 @@ RUN_MANIFEST_VERSION = 1
 FINAL_RESULT_STATUSES = {"passed", "failed", "skipped", "stale_failed"}
 ACTIVE_ROUTING_WORKFLOW_STAGES = {"create_running", "audit_running", "refine_running"}
 PRELAUNCH_AGENT_STATES = {"", AgentRuntimeState.STARTING.value, AgentRuntimeState.DEAD.value}
+BUSINESS_FILE_IGNORED_DIR_NAMES = {
+    ".agent_init_runtime",
+    ".benchmarks",
+    ".cache",
+    ".codex_tmp",
+    ".detailed_design_runtime",
+    ".development_runtime",
+    ".eggs",
+    ".git",
+    ".hypothesis",
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".requirements_analysis_runtime",
+    ".requirements_clarification_runtime",
+    ".requirements_intake_runtime",
+    ".requirements_review_runtime",
+    ".routing_init_runtime",
+    ".ruff_cache",
+    ".tmp",
+    ".tmux_stage_locks",
+    ".tmux_workflow",
+    ".tox",
+    ".venv",
+    "_tui_e2e_projects",
+    "__pycache__",
+    "codex-disk-incident",
+    "ENV",
+    "env",
+    "node_modules",
+    "venv",
+}
+BUSINESS_FILE_IGNORED_FILE_NAMES = {
+    ".DS_Store",
+    ".editorconfig",
+    ".gitattributes",
+    ".gitignore",
+}
 
 
 def _now_iso() -> str:
@@ -128,6 +166,52 @@ def missing_routing_layer_files(work_dir: str | Path) -> list[str]:
         if file_path.stat().st_size == 0:
             missing.append(relative_path)
     return missing
+
+
+def project_has_business_files(work_dir: str | Path) -> bool:
+    root = resolve_existing_directory(work_dir)
+
+    def visit(directory: Path) -> bool:
+        try:
+            entries = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError:
+            return True
+        for entry in entries:
+            name = entry.name
+            if entry.is_symlink():
+                if name in BUSINESS_FILE_IGNORED_DIR_NAMES or name in BUSINESS_FILE_IGNORED_FILE_NAMES:
+                    continue
+                return True
+            if entry.is_dir():
+                if name in BUSINESS_FILE_IGNORED_DIR_NAMES:
+                    continue
+                if visit(entry):
+                    return True
+                continue
+            if entry.is_file():
+                if name in BUSINESS_FILE_IGNORED_FILE_NAMES:
+                    continue
+                return True
+            if name not in BUSINESS_FILE_IGNORED_DIR_NAMES and name not in BUSINESS_FILE_IGNORED_FILE_NAMES:
+                return True
+        return False
+
+    return visit(root)
+
+
+def should_skip_routing_init_for_empty_project(
+        work_dir: str | Path,
+        *,
+        project_missing_files: Sequence[str] = (),
+        target_dirs: Sequence[str | Path] = (),
+        explicit_run_init_yes: bool = False,
+) -> bool:
+    return (
+        bool(project_missing_files)
+        and not tuple(target_dirs or ())
+        and not explicit_run_init_yes
+        and not project_has_business_files(work_dir)
+    )
 
 
 def _load_routing_json(path: Path) -> dict[str, object]:
@@ -264,7 +348,7 @@ def resolve_target_selection(
     forced_dirs: list[str] = []
 
     if not run_init:
-        if project_missing:
+        if project_missing and project_has_business_files(project_root):
             selected_dirs = [str(project_root)]
             forced_dirs = [str(project_root)]
             skipped_dirs = [
@@ -902,6 +986,31 @@ def _is_active_prelaunch_state_update(
     )
 
 
+def _entry_has_active_routing_turn(entry: "WorkerManifestEntry", state: dict[str, object] | None = None) -> bool:
+    payload = dict(state or {})
+    workflow_stage = str(payload.get("workflow_stage", entry.workflow_stage) or "").strip()
+    result_status = str(payload.get("result_status", entry.result_status) or "").strip()
+    current_task_runtime_status = str(
+        payload.get("current_task_runtime_status", entry.current_task_runtime_status) or ""
+    ).strip().lower()
+    current_turn_status_path = str(
+        payload.get("current_turn_status_path", entry.current_turn_status_path) or ""
+    ).strip()
+    if workflow_stage not in ACTIVE_ROUTING_WORKFLOW_STAGES:
+        return False
+    if result_status not in {"running", "pending"}:
+        return False
+    return current_task_runtime_status == "running" or bool(current_turn_status_path)
+
+
+def _normalize_active_routing_entry_display_state(entry: "WorkerManifestEntry") -> None:
+    if (
+        str(entry.agent_state or "").strip().upper() == AgentRuntimeState.READY.value
+        and _entry_has_active_routing_turn(entry)
+    ):
+        entry.agent_state = AgentRuntimeState.BUSY.value
+
+
 @dataclass
 class WorkerManifestEntry:
     work_dir: str
@@ -926,6 +1035,7 @@ class WorkerManifestEntry:
     current_turn_phase: str = ""
     current_turn_status_path: str = ""
     current_turn_baseline_hashes: dict[str, str] = field(default_factory=dict)
+    current_task_runtime_status: str = ""
     recoverable: bool = True
     health_status: str = "unknown"
     health_note: str = ""
@@ -1084,6 +1194,7 @@ class RunStore:
                 current_turn_phase=str(item.get("current_turn_phase", "")),
                 current_turn_status_path=str(item.get("current_turn_status_path", "")),
                 current_turn_baseline_hashes=dict(item.get("current_turn_baseline_hashes", {})),
+                current_task_runtime_status=str(item.get("current_task_runtime_status", "")),
                 recoverable=bool(item.get("recoverable", True)),
                 health_status=str(item.get("health_status", "unknown")),
                 health_note=str(item.get("health_note", "")),
@@ -1102,6 +1213,8 @@ class RunStore:
             for item in payload.get("workers", [])
             if isinstance(item, dict)
         ]
+        for worker in workers:
+            _normalize_active_routing_entry_display_state(worker)
         manifest = RunManifest(
             manifest_version=int(payload.get("manifest_version", RUN_MANIFEST_VERSION)),
             run_id=str(payload["run_id"]),
@@ -1206,6 +1319,7 @@ class RunStore:
         entry.current_turn_id = str(state.get("current_turn_id", entry.current_turn_id))
         entry.current_turn_phase = str(state.get("current_turn_phase", entry.current_turn_phase))
         entry.current_turn_status_path = str(state.get("current_turn_status_path", entry.current_turn_status_path))
+        entry.current_task_runtime_status = str(state.get("current_task_runtime_status", entry.current_task_runtime_status))
         baseline_hashes = state.get("current_turn_baseline_hashes", entry.current_turn_baseline_hashes)
         if isinstance(baseline_hashes, dict):
             entry.current_turn_baseline_hashes = {
@@ -1224,6 +1338,7 @@ class RunStore:
         entry.raw_log_path = str(state.get("raw_log_path", entry.raw_log_path))
         entry.state_path = str(state.get("state_path", entry.state_path))
         entry.transcript_path = str(state.get("transcript_path", entry.transcript_path))
+        _normalize_active_routing_entry_display_state(entry)
         return entry
 
     def update_worker_binding(self, work_dir: str, **fields: object) -> WorkerManifestEntry:
@@ -1231,6 +1346,7 @@ class RunStore:
         for key, value in fields.items():
             if hasattr(entry, key):
                 setattr(entry, key, value)
+        _normalize_active_routing_entry_display_state(entry)
         self.write_manifest()
         return entry
 
@@ -1280,6 +1396,7 @@ class RunStore:
         for key, value in fields.items():
             if hasattr(entry, key):
                 setattr(entry, key, value)
+        _normalize_active_routing_entry_display_state(entry)
         self.write_manifest()
         return entry
 
@@ -1306,6 +1423,7 @@ class RunStore:
         entry.current_turn_phase = ""
         entry.current_turn_status_path = ""
         entry.current_turn_baseline_hashes = {}
+        entry.current_task_runtime_status = ""
         self.write_manifest()
         self.append_event(
             "result_finalized",

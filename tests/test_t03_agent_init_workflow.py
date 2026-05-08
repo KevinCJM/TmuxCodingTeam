@@ -43,6 +43,7 @@ from T03_agent_init_workflow import (
     normalize_audit_output,
     prepare_revise_audit_output,
     prepare_live_workers,
+    project_has_business_files,
     resolve_target_selection,
     run_batch_initialization,
     run_directory_initialization_with_worker,
@@ -375,6 +376,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
             project_dir = (Path(tmpdir) / "project").resolve()
             calc_dir = (project_dir / "calc").resolve()
             calc_dir.mkdir(parents=True)
+            (project_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
             selection = resolve_target_selection(
                 project_dir=project_dir,
                 target_dirs=("calc",),
@@ -384,6 +386,39 @@ class AgentInitWorkflowTests(unittest.TestCase):
             self.assertEqual(selection.skipped_dirs, (str(calc_dir),))
             self.assertEqual(selection.forced_dirs, (str(project_dir),))
             self.assertTrue(selection.project_missing_files)
+
+    def test_resolve_target_selection_skips_empty_missing_project_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            (project_dir / ".routing_init_runtime").mkdir()
+            (project_dir / ".routing_init_runtime" / "manifest.json").write_text("{}", encoding="utf-8")
+            (project_dir / ".pytest_cache").mkdir()
+            (project_dir / "__pycache__").mkdir()
+            (project_dir / "__pycache__" / "module.pyc").write_bytes(b"cache")
+            (project_dir / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
+
+            selection = resolve_target_selection(
+                project_dir=project_dir,
+                run_init=False,
+            )
+            self.assertFalse(project_has_business_files(project_dir))
+            self.assertFalse(selection.should_run)
+            self.assertEqual(selection.selected_dirs, ())
+            self.assertEqual(selection.skipped_dirs, (str(project_dir),))
+            self.assertEqual(selection.forced_dirs, ())
+            self.assertTrue(selection.project_missing_files)
+
+    def test_project_has_business_files_counts_unignored_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            outside_dir = (Path(tmpdir) / "outside").resolve()
+            project_dir.mkdir()
+            outside_dir.mkdir()
+            (outside_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            (project_dir / "linked_app").symlink_to(outside_dir, target_is_directory=True)
+
+            self.assertTrue(project_has_business_files(project_dir))
 
     def test_resolve_target_selection_skips_all_when_disabled_and_complete(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1253,6 +1288,63 @@ class AgentInitWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(entry)
         self.assertEqual(entry.agent_state, AgentRuntimeState.DEAD.value)
         self.assertEqual(entry.health_status, "missing_session")
+
+    def test_run_store_marks_ready_agent_busy_while_routing_turn_is_active(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            selection = resolve_target_selection(project_dir=project_dir, run_init=True)
+            config = AgentRunConfig(vendor="codex", model="gpt-5")
+            store = RunStore.create(
+                selection=selection,
+                config=config,
+                runtime_root=Path(tmpdir) / "runtime",
+                run_id="run_demo",
+            )
+            state_path = Path(tmpdir) / "worker.state.json"
+            turn_status_path = Path(tmpdir) / "turn_status.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "sess-routing",
+                        "pane_id": "%1",
+                        "runtime_dir": str(state_path.parent),
+                        "result_status": "running",
+                        "agent_state": "READY",
+                        "agent_alive": True,
+                        "agent_started": True,
+                        "current_task_runtime_status": "running",
+                        "current_turn_status_path": str(turn_status_path),
+                        "health_status": "alive",
+                        "health_note": "alive",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            store.update_worker_binding(
+                str(project_dir),
+                session_name="sess-routing",
+                pane_id="%1",
+                workflow_stage="create_running",
+                result_status="running",
+                agent_state=AgentRuntimeState.READY.value,
+                agent_started=True,
+                health_status="alive",
+                note="create_routing_layer",
+                state_path=str(state_path),
+                current_turn_status_path=str(turn_status_path),
+            )
+
+            entry = store.update_worker_state_from_file(
+                str(project_dir),
+                state_path,
+                preserve_workflow_fields=True,
+            )
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.agent_state, AgentRuntimeState.BUSY.value)
+        self.assertEqual(entry.current_task_runtime_status, "running")
 
     def test_run_store_load_maps_legacy_worker_manifest_phase_to_agent_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:

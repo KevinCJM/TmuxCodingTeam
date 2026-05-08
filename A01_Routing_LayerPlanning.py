@@ -39,10 +39,12 @@ from T03_agent_init_workflow import (
     RunStore,
     cleanup_routing_stage_artifacts,
     kill_run_tmux_sessions,
+    project_has_business_files,
     routing_layer_readiness_issues,
     resolve_existing_directory,
     resolve_target_selection,
     run_batch_initialization,
+    should_skip_routing_init_for_empty_project,
 )
 from T09_terminal_ops import (
     PROMPT_BACK_VALUE,
@@ -72,6 +74,7 @@ DEFAULT_MODEL_BY_VENDOR = dict(LEGACY_DEFAULT_MODEL_BY_VENDOR)
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
 PROXY_PRESET_CHOICES = ("", "10900", "7890")
 RUN_INIT_CHOICES = ("yes", "no")
+EMPTY_PROJECT_ROUTING_SKIP_MESSAGE = "当前项目未检测到业务文件，跳过路由层初始化。"
 
 
 @dataclass(frozen=True)
@@ -426,8 +429,14 @@ def _collect_interactive_cli_request(
             if step == 1:
                 project_missing_files = tuple(routing_layer_readiness_issues(project_dir))
                 if project_missing_files:
-                    run_init = True
-                    if not args.run_init:
+                    should_skip_empty_project = should_skip_routing_init_for_empty_project(
+                        project_dir,
+                        project_missing_files=project_missing_files,
+                        target_dirs=target_dirs,
+                        explicit_run_init_yes=bool(args.run_init and normalize_run_init_choice(args.run_init)),
+                    )
+                    run_init = not should_skip_empty_project
+                    if not should_skip_empty_project and not args.run_init:
                         message("当前项目路由层文件缺失, 强制执行路由初始化")
                 else:
                     with _routing_prompt_step(1, allow_back=step > first_prompt_step):
@@ -523,9 +532,17 @@ def collect_cli_request(
         if args.project_dir
         else prompt_project_dir("")
     )
+    target_dirs = tuple(args.target_dir or ())
     project_missing_files = tuple(routing_layer_readiness_issues(project_dir))
+    explicit_run_init_yes = bool(args.run_init and normalize_run_init_choice(args.run_init))
+    should_skip_empty_project = should_skip_routing_init_for_empty_project(
+        project_dir,
+        project_missing_files=project_missing_files,
+        target_dirs=target_dirs,
+        explicit_run_init_yes=explicit_run_init_yes,
+    )
     if project_missing_files:
-        requested_run_init = True
+        requested_run_init = not should_skip_empty_project
     else:
         requested_run_init = (
             normalize_run_init_choice(args.run_init)
@@ -533,13 +550,12 @@ def collect_cli_request(
             else (True if parameter_mode else prompt_run_init(True))
         )
     run_init = requested_run_init
-    if project_missing_files and (
+    if project_missing_files and not should_skip_empty_project and (
         (args.run_init and not normalize_run_init_choice(args.run_init))
         or (not args.run_init and not parameter_mode)
     ):
         message("当前项目路由层文件缺失, 强制执行路由初始化")
 
-    target_dirs = tuple(args.target_dir or ())
     if run_init and not args.target_dir and not parameter_mode:
         target_dirs = prompt_target_dirs(())
     if not run_init:
@@ -918,7 +934,10 @@ def run_routing_stage(argv: Sequence[str] | None = None) -> RoutingStageResult:
         config, selection = prepare_batch_request(request)
 
         if not selection.should_run:
-            message("当前项目路由层已完备，跳过路由初始化。")
+            if selection.project_missing_files and not project_has_business_files(selection.project_dir):
+                message(EMPTY_PROJECT_ROUTING_SKIP_MESSAGE)
+            else:
+                message("当前项目路由层已完备，跳过路由初始化。")
             message(render_requirements_stage_placeholder([]))
             return RoutingStageResult(
                 project_dir=request.project_dir,

@@ -95,6 +95,7 @@ from B01_terminal_interaction import (
     render_control_help,
 )
 from T03_agent_init_workflow import (
+    ACTIVE_ROUTING_WORKFLOW_STAGES,
     RunStore,
     list_routing_run_manifest_paths,
     required_routing_layer_paths,
@@ -1129,6 +1130,34 @@ def _state_indicates_active_agent_execution(state: Mapping[str, Any]) -> bool:
     )
 
 
+def _routing_worker_snapshot_has_active_turn(snapshot: Mapping[str, Any]) -> bool:
+    workflow_stage = str(snapshot.get("workflow_stage", "") or snapshot.get("workflowStage", "") or "").strip()
+    status = str(snapshot.get("status", "") or snapshot.get("result_status", "") or "").strip()
+    current_task_runtime_status = str(
+        snapshot.get("current_task_runtime_status", "") or snapshot.get("currentTaskRuntimeStatus", "") or ""
+    ).strip().lower()
+    turn_status_path = str(
+        snapshot.get("turn_status_path", "") or snapshot.get("current_turn_status_path", "") or ""
+    ).strip()
+    if workflow_stage not in ACTIVE_ROUTING_WORKFLOW_STAGES:
+        return False
+    if status not in {"running", "pending"}:
+        return False
+    return current_task_runtime_status == "running" or bool(turn_status_path)
+
+
+def _normalize_routing_worker_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = dict(snapshot)
+    if (
+        str(normalized.get("agent_state", "") or normalized.get("agentState", "") or "").strip().upper() == "READY"
+        and _routing_worker_snapshot_has_active_turn(normalized)
+    ):
+        normalized["agent_state"] = "BUSY"
+        if "agentState" in normalized:
+            normalized["agentState"] = "BUSY"
+    return normalized
+
+
 def _read_worker_state_snapshot(
     state_path: str | Path,
     *,
@@ -1700,6 +1729,12 @@ class BridgeCore:
         health_status = str(snapshot.get("health_status") or getattr(entry, "health_status", "") or "unknown").strip()
         health_note = str(snapshot.get("health_note") or getattr(entry, "health_note", "") or "").strip()
         note = str(snapshot.get("note") or getattr(entry, "note", "") or "").strip()
+        current_task_runtime_status = str(
+            snapshot.get("current_task_runtime_status") or getattr(entry, "current_task_runtime_status", "") or ""
+        ).strip()
+        turn_status_path = str(
+            snapshot.get("turn_status_path") or getattr(entry, "current_turn_status_path", "") or ""
+        ).strip()
         agent_started = bool(snapshot.get("agent_started", getattr(entry, "agent_started", False)))
         agent_state = _normalize_worker_agent_state(
             {
@@ -1720,7 +1755,7 @@ class BridgeCore:
             health_status=health_status,
             health_note=health_note,
         )
-        return {
+        return _normalize_routing_worker_snapshot({
             "session_name": session_name,
             "work_dir": str(snapshot.get("work_dir") or getattr(entry, "work_dir", "") or "").strip(),
             "status": status,
@@ -1728,16 +1763,17 @@ class BridgeCore:
             "agent_state": agent_state,
             "health_status": health_status,
             "health_note": health_note,
+            "current_task_runtime_status": current_task_runtime_status,
             "retry_count": int(snapshot.get("retry_count") or getattr(entry, "retry_count", 0) or 0),
             "note": note,
             "transcript_path": str(snapshot.get("transcript_path") or getattr(entry, "transcript_path", "") or "").strip(),
-            "turn_status_path": str(snapshot.get("turn_status_path", "") or "").strip(),
+            "turn_status_path": turn_status_path,
             "question_path": str(snapshot.get("question_path", "") or "").strip(),
             "answer_path": str(snapshot.get("answer_path", "") or "").strip(),
             "artifact_paths": list(snapshot.get("artifact_paths", [])),
             "session_exists": session_exists,
             "updated_at": str(snapshot.get("updated_at") or "").strip(),
-        }
+        })
 
     def _infer_workflow_a00_stage_label(self, project_dir: str, requirement_name: str) -> str:
         if not project_dir:
@@ -2012,6 +2048,7 @@ class BridgeCore:
             session.transition_text = center.transition_to_requirements_phase(session.final_result)
         build_workers = getattr(center, "build_worker_snapshots", None)
         worker_snapshots = build_workers() if callable(build_workers) else _serialize(getattr(center, "build_status_rows")())
+        worker_snapshots = [_normalize_routing_worker_snapshot(worker) for worker in worker_snapshots]
         return {
             "supported": True,
             "control_id": session.control_id,

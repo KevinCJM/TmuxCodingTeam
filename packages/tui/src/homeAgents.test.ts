@@ -165,12 +165,13 @@ test('buildHomeAgents keeps control workers when duplicate sessions exist across
     { source: 'requirements', workers: [worker({ sessionName: 'sess-2', sessionExists: true })] },
   ])
   expect(agents).toHaveLength(2)
-  expect(agents[0]).toMatchObject({
+  expect(agents.map((agent) => agent.sessionName)).toEqual(['sess-2', 'sess-1'])
+  expect(agents.find((agent) => agent.sessionName === 'sess-1')).toMatchObject({
     source: 'control',
     sessionName: 'sess-1',
     attachCommand: 'tmux attach -t sess-1',
   })
-  expect(agents[1]).toMatchObject({
+  expect(agents.find((agent) => agent.sessionName === 'sess-2')).toMatchObject({
     source: 'requirements',
     sessionName: 'sess-2',
   })
@@ -270,4 +271,150 @@ test('buildHomeAgents shows prelaunch routing workers as STARTING', () => {
     healthStatus: 'unknown',
     agentState: 'STARTING',
   })
+})
+
+test('buildHomeAgents keeps stable role order when heartbeat freshness changes', () => {
+  const first = buildHomeAgents(
+    [
+      {
+        source: 'development',
+        workers: [
+          worker({
+            workerId: 'development-review-审核员',
+            sessionName: '审核员-地奇星',
+            sessionExists: true,
+            agentState: 'BUSY',
+            lastHeartbeatAt: '2026-04-22T10:00:03+08:00',
+          }),
+          worker({
+            workerId: 'development-developer',
+            sessionName: '开发工程师-天贵星',
+            sessionExists: true,
+            agentState: 'READY',
+            lastHeartbeatAt: '2026-04-22T10:00:01+08:00',
+          }),
+          worker({
+            workerId: 'development-review-测试工程师',
+            sessionName: '测试工程师-亢金龙',
+            sessionExists: true,
+            agentState: 'STARTING',
+            lastHeartbeatAt: '2026-04-22T10:00:02+08:00',
+          }),
+        ],
+      },
+    ],
+    'stage.a07.start',
+  )
+  const second = buildHomeAgents(
+    [
+      {
+        source: 'development',
+        workers: [
+          worker({
+            workerId: 'development-review-审核员',
+            sessionName: '审核员-地奇星',
+            sessionExists: true,
+            agentState: 'READY',
+            lastHeartbeatAt: '2026-04-22T10:00:01+08:00',
+          }),
+          worker({
+            workerId: 'development-developer',
+            sessionName: '开发工程师-天贵星',
+            sessionExists: true,
+            agentState: 'BUSY',
+            lastHeartbeatAt: '2026-04-22T10:00:03+08:00',
+          }),
+          worker({
+            workerId: 'development-review-测试工程师',
+            sessionName: '测试工程师-亢金龙',
+            sessionExists: true,
+            agentState: 'DEAD',
+            lastHeartbeatAt: '2026-04-22T10:00:02+08:00',
+          }),
+        ],
+      },
+    ],
+    'stage.a07.start',
+  )
+
+  const expectedOrder = ['开发工程师-天贵星', '测试工程师-亢金龙', '审核员-地奇星']
+  expect(first.map((agent) => agent.sessionName)).toEqual(expectedOrder)
+  expect(second.map((agent) => agent.sessionName)).toEqual(expectedOrder)
+})
+
+test('buildHomeAgents sorts design workers by fixed main and reviewer role order', () => {
+  const agents = buildHomeAgents(
+    [
+      {
+        source: 'design',
+        workers: [
+          worker({ workerId: 'detailed-design-review-审核员', sessionName: '审核员-天机星', sessionExists: true }),
+          worker({ workerId: 'detailed-design-review-架构师', sessionName: '架构师-地速星', sessionExists: true }),
+          worker({ workerId: 'detailed-design-analyst', sessionName: '需求分析师-天佑星', sessionExists: true }),
+          worker({ workerId: 'detailed-design-review-测试工程师', sessionName: '测试工程师-亢金龙', sessionExists: true }),
+          worker({ workerId: 'detailed-design-review-开发工程师', sessionName: '开发工程师-天贵星', sessionExists: true }),
+        ],
+      },
+    ],
+    'stage.a05.start',
+  )
+
+  expect(agents.map((agent) => agent.sessionName)).toEqual([
+    '需求分析师-天佑星',
+    '开发工程师-天贵星',
+    '测试工程师-亢金龙',
+    '架构师-地速星',
+    '审核员-天机星',
+  ])
+})
+
+test('buildHomeAgents sorts development reviewers by fixed role order', () => {
+  const agents = buildHomeAgents(
+    [
+      {
+        source: 'development',
+        workers: [
+          worker({ workerId: 'development-review-架构师', sessionName: '架构师-地速星', sessionExists: true }),
+          worker({ workerId: 'development-review-审核员', sessionName: '审核员-地奇星', sessionExists: true }),
+          worker({ workerId: 'development-review-需求分析师', sessionName: '需求分析师-天机星', sessionExists: true }),
+          worker({ workerId: 'development-developer', sessionName: '开发工程师-天贵星', sessionExists: true }),
+          worker({ workerId: 'development-review-测试工程师', sessionName: '测试工程师-亢金龙', sessionExists: true }),
+        ],
+      },
+    ],
+    'stage.a07.start',
+  )
+
+  expect(agents.map((agent) => agent.sessionName)).toEqual([
+    '开发工程师-天贵星',
+    '需求分析师-天机星',
+    '测试工程师-亢金龙',
+    '审核员-地奇星',
+    '架构师-地速星',
+  ])
+})
+
+test('buildHomeAgents falls back to stable session name order without worker id', () => {
+  const agents = buildHomeAgents(
+    [
+      {
+        source: 'design',
+        workers: [
+          worker({
+            sessionName: '自定义角色-B',
+            sessionExists: true,
+            lastHeartbeatAt: '2026-04-22T10:00:02+08:00',
+          }),
+          worker({
+            sessionName: '自定义角色-A',
+            sessionExists: true,
+            lastHeartbeatAt: '2026-04-22T10:00:01+08:00',
+          }),
+        ],
+      },
+    ],
+    'stage.a05.start',
+  )
+
+  expect(agents.map((agent) => agent.sessionName)).toEqual(['自定义角色-A', '自定义角色-B'])
 })

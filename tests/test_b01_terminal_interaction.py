@@ -82,16 +82,49 @@ class B01TerminalInteractionTests(unittest.TestCase):
             "B01_terminal_interaction.prompt_effort",
             return_value="high",
         ), patch("sys.stdout", new=stdout):
+            Path(tmpdir, "app.py").write_text("print('ok')\n", encoding="utf-8")
             with patch("builtins.input", side_effect=["no"]):
                 request = collect_b01_request(args)
         self.assertTrue(request.run_init)
         self.assertEqual(request.target_dirs, ())
         self.assertIn("当前项目路由层文件缺失, 强制执行路由初始化", stdout.getvalue())
 
+    def test_collect_b01_request_skips_empty_project_missing_routing_without_prompts(self):
+        parser = build_parser()
+        args = parser.parse_args(["--yes"])
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "B01_terminal_interaction.prompt_project_dir",
+            return_value=tmpdir,
+        ), patch(
+            "B01_terminal_interaction.prompt_yes_no",
+            side_effect=AssertionError("空项目缺少路由层时不应询问 yes/no"),
+        ), patch(
+            "B01_terminal_interaction.prompt_target_dirs",
+            side_effect=AssertionError("空项目缺少路由层时不应询问 target dirs"),
+        ), patch(
+            "B01_terminal_interaction.prompt_vendor",
+            side_effect=AssertionError("空项目缺少路由层时不应询问 vendor"),
+        ), patch(
+            "B01_terminal_interaction.prompt_model",
+            side_effect=AssertionError("空项目缺少路由层时不应询问 model"),
+        ), patch(
+            "B01_terminal_interaction.prompt_effort",
+            side_effect=AssertionError("空项目缺少路由层时不应询问 effort"),
+        ):
+            with patch("builtins.input", side_effect=AssertionError("不应触发底层 input")):
+                request = collect_b01_request(args)
+        self.assertFalse(request.run_init)
+        self.assertEqual(request.target_dirs, ())
+        self.assertEqual(request.vendor, "codex")
+        self.assertEqual(request.model, "gpt-5.4")
+        self.assertEqual(request.reasoning_effort, "high")
+        self.assertEqual(request.proxy_port, "")
+
     def test_b01_main_uses_force_yes_confirmation_when_project_routing_is_missing(self):
         parser = build_parser()
         args = parser.parse_args([])
         with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "app.py").write_text("print('ok')\n", encoding="utf-8")
             with patch(
                 "builtins.input",
                 side_effect=[tmpdir, "", "1", "1", "3", "no"],
@@ -122,6 +155,19 @@ class B01TerminalInteractionTests(unittest.TestCase):
                     self.fail("forced confirmation should continue")
                 mocked_confirm.assert_called_once_with(preflight_summary, force_yes=True)
                 mocked_create.assert_not_called()
+
+    def test_b01_main_skips_empty_project_with_specific_message(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "B01_terminal_interaction.maybe_launch_tui",
+            return_value=(False, ["--project-dir", tmpdir, "--yes", "--legacy-cli"]),
+        ), patch(
+            "B01_terminal_interaction.AgentInitControlCenter.create_new",
+            side_effect=AssertionError("空项目不应创建控制中心"),
+        ), patch("sys.stdout", new=stdout):
+            exit_code = main([])
+        self.assertEqual(exit_code, 0)
+        self.assertIn("当前项目未检测到业务文件，跳过路由层初始化。", stdout.getvalue())
 
     def test_collect_b01_request_with_yes_only_still_prompts_for_run_init_and_proxy(self):
         parser = build_parser()

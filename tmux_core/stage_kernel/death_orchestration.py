@@ -125,12 +125,13 @@ def _ensure_main_ready_with_replacement(
     timeout_sec: float,
     allow_completed_nonready: bool = False,
 ) -> TMain:
+    # Main-phase recovery only owns the main worker. Reviewers are filtered by
+    # drop_dead_reviewers and then handled by reviewer-phase wrappers.
     try:
         ensure_main_ready(
             current_main,
-            current_reviewers,
+            (),
             main_label=main_label,
-            reviewer_label_getter=reviewer_label_getter,
             timeout_sec=timeout_sec,
             allow_completed_nonready=allow_completed_nonready,
         )
@@ -141,9 +142,8 @@ def _ensure_main_ready_with_replacement(
     replacement = replace_dead_main_owner(current_main)
     ensure_main_ready(
         replacement,
-        current_reviewers,
+        (),
         main_label=main_label,
-        reviewer_label_getter=reviewer_label_getter,
         timeout_sec=timeout_sec,
         allow_completed_nonready=allow_completed_nonready,
     )

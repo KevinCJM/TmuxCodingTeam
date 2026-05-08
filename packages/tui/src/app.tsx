@@ -619,6 +619,7 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
   const rawArtifactPaths = (value.artifact_paths ?? value.artifactPaths) as unknown
   return {
     index: Number(value.index ?? 0) || undefined,
+    workerId: String(value.worker_id ?? value.workerId ?? ''),
     workDir: String(value.work_dir ?? value.workDir ?? ''),
     sessionName: String(value.session_name ?? value.sessionName ?? ''),
     status: String(value.status ?? ''),

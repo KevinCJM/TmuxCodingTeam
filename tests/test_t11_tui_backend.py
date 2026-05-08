@@ -4263,6 +4263,8 @@ class T11TuiBackendTests(unittest.TestCase):
                                 "result_status": "running",
                                 "agent_state": "READY",
                                 "health_status": "alive",
+                                "current_task_runtime_status": "running",
+                                "current_turn_status_path": str(run_root / "turn_status.json"),
                                 "state_path": "",
                                 "transcript_path": "",
                             }
@@ -4278,6 +4280,8 @@ class T11TuiBackendTests(unittest.TestCase):
             snapshot = server._build_routing_snapshot()  # noqa: SLF001
         self.assertEqual(snapshot["workers"][0]["session_name"], "sess-routing")
         self.assertTrue(snapshot["workers"][0]["session_exists"])
+        self.assertEqual(snapshot["workers"][0]["agent_state"], "BUSY")
+        self.assertEqual(snapshot["workers"][0]["current_task_runtime_status"], "running")
 
     def test_manifest_backed_prelaunch_routing_worker_with_missing_session_stays_starting(self):
         with tempfile.TemporaryDirectory() as tmpdir:

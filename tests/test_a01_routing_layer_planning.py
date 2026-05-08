@@ -33,6 +33,7 @@ from A01_Routing_LayerPlanning import (
     render_routing_failure_summary,
     render_runtime_start_summary,
     render_requirements_stage_placeholder,
+    run_routing_stage,
     summarize_live_result_counts,
     split_target_dirs_text,
 )
@@ -693,33 +694,80 @@ class RoutingLayerCliTests(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["--yes"])
         stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "app.py").write_text("print('ok')\n", encoding="utf-8")
+            with patch(
+                "A01_Routing_LayerPlanning.prompt_project_dir",
+                return_value=tmpdir,
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_run_init",
+                side_effect=AssertionError("缺少路由层文件时不应先询问 run_init"),
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_target_dirs",
+                return_value=(),
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_vendor",
+                return_value="codex",
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_model",
+                return_value="gpt-5.4",
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_effort",
+                return_value="high",
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_proxy_port",
+                return_value="",
+            ), patch("sys.stdout", new=stdout):
+                with patch("builtins.input", side_effect=AssertionError("不应触发底层 input")):
+                    request = collect_cli_request(args)
+        self.assertTrue(request.run_init)
+        self.assertEqual(request.target_dirs, ())
+        self.assertIn("当前项目路由层文件缺失, 强制执行路由初始化", stdout.getvalue())
+
+    def test_collect_cli_request_skips_empty_project_missing_routing_without_prompts(self):
+        parser = build_parser()
+        args = parser.parse_args(["--yes"])
         with tempfile.TemporaryDirectory() as tmpdir, patch(
             "A01_Routing_LayerPlanning.prompt_project_dir",
             return_value=tmpdir,
         ), patch(
             "A01_Routing_LayerPlanning.prompt_run_init",
-            side_effect=AssertionError("缺少路由层文件时不应先询问 run_init"),
+            side_effect=AssertionError("空项目缺少路由层时不应询问 run_init"),
         ), patch(
             "A01_Routing_LayerPlanning.prompt_target_dirs",
-            return_value=(),
+            side_effect=AssertionError("空项目缺少路由层时不应询问 target dirs"),
         ), patch(
             "A01_Routing_LayerPlanning.prompt_vendor",
-            return_value="codex",
+            side_effect=AssertionError("空项目缺少路由层时不应询问 vendor"),
         ), patch(
             "A01_Routing_LayerPlanning.prompt_model",
-            return_value="gpt-5.4",
+            side_effect=AssertionError("空项目缺少路由层时不应询问 model"),
         ), patch(
             "A01_Routing_LayerPlanning.prompt_effort",
-            return_value="high",
+            side_effect=AssertionError("空项目缺少路由层时不应询问 effort"),
         ), patch(
             "A01_Routing_LayerPlanning.prompt_proxy_port",
-            return_value="",
-        ), patch("sys.stdout", new=stdout):
+            side_effect=AssertionError("空项目缺少路由层时不应询问 proxy"),
+        ):
             with patch("builtins.input", side_effect=AssertionError("不应触发底层 input")):
                 request = collect_cli_request(args)
-        self.assertTrue(request.run_init)
+        self.assertFalse(request.run_init)
         self.assertEqual(request.target_dirs, ())
-        self.assertIn("当前项目路由层文件缺失, 强制执行路由初始化", stdout.getvalue())
+        self.assertEqual(request.vendor, "codex")
+        self.assertEqual(request.model, "gpt-5.4")
+        self.assertEqual(request.reasoning_effort, "high")
+        self.assertEqual(request.proxy_port, "")
+
+    def test_run_routing_stage_skips_empty_project_with_specific_message(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "A01_Routing_LayerPlanning.run_batch_initialization",
+            side_effect=AssertionError("空项目不应启动路由初始化"),
+        ), patch("sys.stdout", new=stdout):
+            result = run_routing_stage(["--project-dir", tmpdir, "--yes", "--legacy-cli"])
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("当前项目未检测到业务文件，跳过路由层初始化。", stdout.getvalue())
 
     def test_prompt_functions_print_vendor_model_effort_and_proxy_lists(self):
         stdout = io.StringIO()
@@ -780,32 +828,34 @@ class RoutingLayerCliTests(unittest.TestCase):
             observed["proxy_role_label"] = role_label
             return ""
 
-        with tempfile.TemporaryDirectory() as tmpdir, patch(
-            "A01_Routing_LayerPlanning.prompt_project_dir",
-            return_value=tmpdir,
-        ), patch(
-            "A01_Routing_LayerPlanning.prompt_run_init",
-            return_value=True,
-        ), patch(
-            "A01_Routing_LayerPlanning.prompt_target_dirs",
-            return_value=(),
-        ), patch(
-            "A01_Routing_LayerPlanning._predict_routing_role_label",
-            return_value="路由器-天捷星",
-        ), patch(
-            "A01_Routing_LayerPlanning.prompt_vendor",
-            side_effect=fake_prompt_vendor,
-        ), patch(
-            "A01_Routing_LayerPlanning.prompt_model",
-            side_effect=fake_prompt_model,
-        ), patch(
-            "A01_Routing_LayerPlanning.prompt_effort",
-            side_effect=fake_prompt_effort,
-        ), patch(
-            "A01_Routing_LayerPlanning.prompt_proxy_port",
-            side_effect=fake_prompt_proxy_port,
-        ):
-            request = collect_cli_request(args)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "app.py").write_text("print('ok')\n", encoding="utf-8")
+            with patch(
+                "A01_Routing_LayerPlanning.prompt_project_dir",
+                return_value=tmpdir,
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_run_init",
+                return_value=True,
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_target_dirs",
+                return_value=(),
+            ), patch(
+                "A01_Routing_LayerPlanning._predict_routing_role_label",
+                return_value="路由器-天捷星",
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_vendor",
+                side_effect=fake_prompt_vendor,
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_model",
+                side_effect=fake_prompt_model,
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_effort",
+                side_effect=fake_prompt_effort,
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_proxy_port",
+                side_effect=fake_prompt_proxy_port,
+            ):
+                request = collect_cli_request(args)
 
         self.assertTrue(request.run_init)
         self.assertEqual(observed["vendor_role_label"], "路由器-天捷星")
