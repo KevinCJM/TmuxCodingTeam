@@ -151,6 +151,8 @@ export function PromptTextarea(props: Props) {
             { name: 'return', meta: true, action: 'newline' },
             { name: 'linefeed', meta: true, action: 'newline' },
             { name: 'j', ctrl: true, action: 'newline' },
+            { name: 'backspace', super: true, action: 'delete-line' },
+            { name: 'delete', super: true, action: 'delete-line' },
             { name: 'return', action: 'submit' },
             { name: 'linefeed', action: 'submit' },
           ]}

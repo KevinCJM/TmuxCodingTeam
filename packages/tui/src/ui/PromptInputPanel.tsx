@@ -50,10 +50,18 @@ export function PromptInputPanel(props: Props) {
     }
   }
 
+  const submitBack = () => {
+    const token = promptToken()
+    if (submittedPromptToken === token) return
+    submittedPromptToken = token
+    props.onBack?.()
+  }
+
   useKeyboard((event) => {
     if (props.focused && props.onBack && event.name === 'escape') {
       event.preventDefault()
-      props.onBack()
+      event.stopPropagation()
+      submitBack()
       return
     }
     const isSubmitKey =
@@ -80,7 +88,7 @@ export function PromptInputPanel(props: Props) {
           onMouseUp={(event) => {
             event.preventDefault()
             event.stopPropagation()
-            props.onBack?.()
+            submitBack()
           }}
         >
           <text fg="#00d2ff">[上一步]</text>

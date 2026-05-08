@@ -21,6 +21,15 @@ test('route files exist with expected exports', () => {
   }
 })
 
+test('index handles Ctrl+C through graceful backend shutdown', () => {
+  const content = readFileSync(join(import.meta.dir, 'index.tsx'), 'utf8')
+  expect(content.includes("import { App, stopBackendClient } from './app'")).toBe(true)
+  expect(content.includes('exitOnCtrlC: false')).toBe(true)
+  expect(content.includes("for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const)")).toBe(true)
+  expect(content.includes('await stopBackendClient()')).toBe(true)
+  expect(content.includes('process.exit(exitCodeForSignal(signal))')).toBe(true)
+})
+
 test('development route renders milestone checklist and app status includes current milestone support', () => {
   const routeContent = readFileSync(join(import.meta.dir, 'routes/DevelopmentRoute.tsx'), 'utf8')
   const appContent = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')

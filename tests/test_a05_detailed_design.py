@@ -81,6 +81,28 @@ class _FreshReviewerWorker:
 
 
 class A05DetailedDesignTests(unittest.TestCase):
+    def test_detailed_design_reviewer_count_prompt_allows_previous_step_back(self):
+        from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, PROMPT_BACK_VALUE, PromptBackRequested, use_terminal_ui
+
+        captured_requests: list[BridgePromptRequest] = []
+
+        def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
+            captured_requests.append(request)
+            return {"value": PROMPT_BACK_VALUE}
+
+        ui = BridgeTerminalUI(emit_event=lambda *_args, **_kwargs: None, request_prompt=request_prompt)
+
+        with use_terminal_ui(ui), self.assertRaises(PromptBackRequested):
+            collect_interactive_reviewer_specs(allow_back_first_prompt=True)
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(captured_requests[0].prompt_type, "text")
+        self.assertEqual(captured_requests[0].payload["prompt_text"], "请输入详细设计审核智能体数量")
+        self.assertTrue(captured_requests[0].payload["allow_back"])
+        self.assertEqual(captured_requests[0].payload["back_value"], PROMPT_BACK_VALUE)
+        self.assertEqual(captured_requests[0].payload["stage_key"], "detailed_design_reviewer_specs")
+        self.assertEqual(captured_requests[0].payload["stage_step_index"], 0)
+
     def test_review_limit_force_hitl_contract_uses_outcome_scoped_artifacts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = build_detailed_design_paths(tmpdir, "需求A")

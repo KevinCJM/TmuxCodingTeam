@@ -511,7 +511,7 @@ def build_missing_task_result_finalization_candidate(
         return None
     return MissingTaskResultFinalizationCandidate(
         decision=decision,
-        requires_agent_ready=False,
+        requires_agent_ready=True,
         signature=(decision.status, tuple(sorted(artifact_signatures))),
     )
 

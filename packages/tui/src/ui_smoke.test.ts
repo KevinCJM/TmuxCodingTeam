@@ -30,6 +30,8 @@ test('PromptInputPanel centralizes title, optional helper lines, and textarea wi
   expect(content.includes('rememberPromptValue')).toBe(true)
   expect(content.includes('submittedPromptToken')).toBe(true)
   expect(content.includes("props.focused && props.onBack && event.name === 'escape'")).toBe(true)
+  expect(content.includes('const submitBack = () => {')).toBe(true)
+  expect(content.includes('props.onBack?.()')).toBe(true)
   expect(content.includes('<text fg="#00d2ff">[上一步]</text>')).toBe(true)
   expect(content.includes("props.showSubmitHelper && multiline() ? 'Enter 提交，Shift+Enter / Meta+Enter / Ctrl+J 换行' : ''")).toBe(true)
   expect(content.includes('<PromptTextarea')).toBe(true)
@@ -58,12 +60,15 @@ test('DialogPrompt delegates to PromptInputPanel instead of assembling its own h
   expect(content.includes('<PromptInputPanel')).toBe(true)
   expect(content.includes("mode={props.multiline ? 'multiline' : 'singleline'}")).toBe(true)
   expect(content.includes('showSubmitHelper={Boolean(props.multiline)}')).toBe(true)
+  expect(content.includes('onBack?: () => void')).toBe(true)
+  expect(content.includes('onBack={props.onBack}')).toBe(true)
   expect(content.includes('<PromptTextarea')).toBe(false)
 })
 
 test('TUI startup enables mouse capture, alternate-screen mode, and disables noisy console overlay', () => {
   const content = readFileSync(join(import.meta.dir, 'index.tsx'), 'utf8')
   expect(content.includes('useMouse: true')).toBe(true)
+  expect(content.includes('useKittyKeyboard: { disambiguate: true, alternateKeys: true, allKeysAsEscapes: true }')).toBe(true)
   expect(content.includes("screenMode: 'alternate-screen'")).toBe(true)
   expect(content.includes("consoleMode: 'disabled'")).toBe(true)
   expect(content.includes('openConsoleOnError: false')).toBe(true)
@@ -91,6 +96,12 @@ test('PromptTextarea submits return and linefeed key events', () => {
   const content = readFileSync(join(import.meta.dir, 'ui/PromptTextarea.tsx'), 'utf8')
   expect(content.includes("{ name: 'return', action: 'submit' }")).toBe(true)
   expect(content.includes("{ name: 'linefeed', action: 'submit' }")).toBe(true)
+})
+
+test('PromptTextarea binds Command+Delete to delete the current line', () => {
+  const content = readFileSync(join(import.meta.dir, 'ui/PromptTextarea.tsx'), 'utf8')
+  expect(content.includes("{ name: 'backspace', super: true, action: 'delete-line' }")).toBe(true)
+  expect(content.includes("{ name: 'delete', super: true, action: 'delete-line' }")).toBe(true)
 })
 
 test('PromptTextarea explicitly focuses the textarea on mount and reset', () => {

@@ -12,6 +12,8 @@ type BackendEnvelope = {
   error?: string
 }
 
+const BACKEND_STOP_KILL_GRACE_MS = 1500
+
 export type BackendEvent = {
   type: string
   payload: Record<string, unknown>
@@ -33,6 +35,9 @@ export function readPythonPath() {
 
 export class BackendClient {
   private process?: Bun.Subprocess<'pipe', 'pipe', 'pipe'>
+  private stoppingProcess?: Bun.Subprocess<'pipe', 'pipe', 'pipe'>
+  private stoppingPromise?: Promise<void>
+  private processExitHandler?: () => void
   private nextId = 1
   private buffer = ''
   private pending = new Map<string, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>()
@@ -49,11 +54,32 @@ export class BackendClient {
       stderr: 'pipe',
       env: process.env,
     })
+    this.ensureProcessExitHandler()
     this.consumeStream(this.process.stdout)
     this.consumeStderr(this.process.stderr)
   }
 
-  stop() {
+  private ensureProcessExitHandler() {
+    if (this.processExitHandler) return
+    this.processExitHandler = () => {
+      const child = this.process ?? this.stoppingProcess
+      if (!child) return
+      try {
+        child.kill('SIGTERM')
+      } catch {
+        // Process is already gone.
+      }
+    }
+    process.on('exit', this.processExitHandler)
+  }
+
+  private clearProcessExitHandlerIfIdle() {
+    if (this.process || this.stoppingProcess || !this.processExitHandler) return
+    process.off('exit', this.processExitHandler)
+    this.processExitHandler = undefined
+  }
+
+  async stop(forceKillAfterMs = BACKEND_STOP_KILL_GRACE_MS) {
     const pending = [...this.pending.values()]
     this.pending.clear()
     for (const waiter of pending) {
@@ -62,8 +88,44 @@ export class BackendClient {
     this.listeners.clear()
     const child = this.process
     this.process = undefined
-    if (!child) return
-    child.kill()
+    if (!child) {
+      if (this.stoppingPromise) await this.stoppingPromise
+      return
+    }
+    if (this.stoppingProcess === child && this.stoppingPromise) {
+      await this.stoppingPromise
+      return
+    }
+    this.stoppingProcess = child
+    try {
+      child.kill('SIGTERM')
+    } catch {
+      this.stoppingProcess = undefined
+      this.clearProcessExitHandlerIfIdle()
+      return
+    }
+    const exited = child.exited
+    if (!exited || typeof exited.finally !== 'function') {
+      this.stoppingProcess = undefined
+      this.clearProcessExitHandlerIfIdle()
+      return
+    }
+    const timer = setTimeout(() => {
+      if (this.stoppingProcess !== child) return
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        // Process is already gone.
+      }
+    }, Math.max(0, forceKillAfterMs))
+    const stopPromise = Promise.resolve(exited).catch(() => undefined).finally(() => {
+      if (timer) clearTimeout(timer)
+      if (this.stoppingProcess === child) this.stoppingProcess = undefined
+      if (this.stoppingPromise === stopPromise) this.stoppingPromise = undefined
+      this.clearProcessExitHandlerIfIdle()
+    })
+    this.stoppingPromise = stopPromise
+    await this.stoppingPromise
   }
 
   private async consumeStderr(stream: ReadableStream<Uint8Array>) {

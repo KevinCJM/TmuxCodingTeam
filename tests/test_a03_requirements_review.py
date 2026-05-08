@@ -709,6 +709,27 @@ class A03RequirementsReviewTests(unittest.TestCase):
         self.assertEqual(observed_role_labels, ["审核器-天平星", "审核器-地隐星"])
         self.assertTrue(any("审核器-天勇星" in occupied for occupied in observed_occupied_sets))
 
+    def test_requirements_reviewer_count_prompt_allows_previous_step_back(self):
+        captured_requests: list[BridgePromptRequest] = []
+
+        def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
+            captured_requests.append(request)
+            return {"value": PROMPT_BACK_VALUE}
+
+        ui = BridgeTerminalUI(emit_event=lambda *_args, **_kwargs: None, request_prompt=request_prompt)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with use_terminal_ui(ui), self.assertRaises(PromptBackRequested):
+                build_reviewer_workers(project_dir=tmpdir, requirement_name="需求A", allow_back_first_prompt=True)
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(captured_requests[0].prompt_type, "text")
+        self.assertEqual(captured_requests[0].payload["prompt_text"], "请输入审核器数量")
+        self.assertTrue(captured_requests[0].payload["allow_back"])
+        self.assertEqual(captured_requests[0].payload["back_value"], PROMPT_BACK_VALUE)
+        self.assertEqual(captured_requests[0].payload["stage_key"], "requirements_review")
+        self.assertEqual(captured_requests[0].payload["stage_step_index"], 1)
+
     def test_prompt_review_agent_selection_accepts_back_kwargs(self):
         import A04_RequirementsReview as review_module
 

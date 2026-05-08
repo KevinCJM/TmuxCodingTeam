@@ -54,6 +54,52 @@ def _has_ever_launched(worker: object | None) -> bool:
     return False
 
 
+def _read_worker_state(worker: object | None) -> dict[str, object]:
+    if worker is None:
+        return {}
+    read_state = getattr(worker, "read_state", None)
+    if not callable(read_state):
+        return {}
+    try:
+        state = read_state()
+    except Exception:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _reviewer_ready_check_should_be_skipped(reviewer: object | None) -> bool:
+    worker = _resolve_worker(reviewer)
+    state = _read_worker_state(worker)
+    if worker_state_is_prelaunch_active(state or worker):
+        return False
+    status = str(state.get("status", getattr(worker, "status", "")) or "").strip().lower()
+    result_status = str(state.get("result_status", getattr(worker, "result_status", "")) or "").strip().lower()
+    health_status = str(state.get("health_status", getattr(worker, "health_status", "")) or "").strip().lower()
+    return status in {"failed", "stale_failed", "error"} or result_status in {"failed", "error"} or health_status in {
+        "dead",
+        "missing_session",
+        "pane_dead",
+        "provider_runtime_error",
+    }
+
+
+def _filter_reviewers_for_final_ready_check(
+    reviewers: Sequence[TReviewer],
+    *,
+    reviewer_label_getter: Callable[[TReviewer, int], str] | None = None,
+    notify: Callable[[str], None] | None = None,
+) -> list[TReviewer]:
+    selected: list[TReviewer] = []
+    for index, reviewer in enumerate(reviewers, start=1):
+        if not _reviewer_ready_check_should_be_skipped(reviewer):
+            selected.append(reviewer)
+            continue
+        if notify is not None:
+            label = reviewer_label_getter(reviewer, index) if reviewer_label_getter is not None else f"审核智能体 {index}"
+            notify(f"{label} 当前处于失败/异常状态，阶段末尾将忽略该审核智能体。")
+    return selected
+
+
 def drop_dead_reviewers(
     reviewers: Sequence[TReviewer],
     *,
@@ -235,9 +281,14 @@ def run_reviewer_phase_with_death_handling(
         reviewer_label_getter=reviewer_label_getter,
         notify=notify,
     )
+    reviewers_for_ready_check = _filter_reviewers_for_final_ready_check(
+        updated_reviewers,
+        reviewer_label_getter=reviewer_label_getter,
+        notify=notify,
+    )
     ensure_reviewers_ready(
         current_main,
-        updated_reviewers,
+        reviewers_for_ready_check,
         main_label=main_label,
         reviewer_label_getter=reviewer_label_getter,
         timeout_sec=timeout_sec,

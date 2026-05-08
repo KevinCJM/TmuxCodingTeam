@@ -96,6 +96,7 @@ from B01_terminal_interaction import (
 )
 from T03_agent_init_workflow import (
     ACTIVE_ROUTING_WORKFLOW_STAGES,
+    ROUTING_RUNTIME_ROOT_NAME,
     RunStore,
     list_routing_run_manifest_paths,
     required_routing_layer_paths,
@@ -135,10 +136,13 @@ class PromptBroker:
         self._pending: dict[str, queue.Queue[dict[str, Any]]] = {}
         self._lock = threading.Lock()
         self._prompt_seq = 0
+        self._shutdown_reason = ""
 
     def request(self, request: BridgePromptRequest) -> dict[str, Any]:
         prompt_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         with self._lock:
+            if self._shutdown_reason:
+                raise RuntimeError(self._shutdown_reason)
             self._prompt_seq += 1
             prompt_id = f"prompt_{threading.get_ident()}_{self._prompt_seq}"
             self._pending[prompt_id] = prompt_queue
@@ -153,7 +157,11 @@ class PromptBroker:
         if self._on_prompt_open is not None:
             self._on_prompt_open(prompt_id, request)
         try:
-            return prompt_queue.get()
+            payload = prompt_queue.get()
+            shutdown_reason = str(payload.get("__prompt_broker_shutdown__", "")).strip()
+            if shutdown_reason:
+                raise RuntimeError(shutdown_reason)
+            return payload
         finally:
             with self._lock:
                 self._pending.pop(prompt_id, None)
@@ -169,6 +177,21 @@ class PromptBroker:
             prompt_queue.put_nowait(dict(payload or {}))
         except queue.Full:
             return
+
+    def shutdown(self, reason: str = "TUI backend 已关闭，取消等待中的输入。") -> None:
+        normalized_reason = str(reason or "").strip() or "TUI backend 已关闭，取消等待中的输入。"
+        with self._lock:
+            self._shutdown_reason = normalized_reason
+            pending = list(self._pending.items())
+        for prompt_id, prompt_queue in pending:
+            payload = {"__prompt_broker_shutdown__": normalized_reason}
+            if self._on_prompt_resolved is not None:
+                with contextlib.suppress(Exception):
+                    self._on_prompt_resolved(str(prompt_id).strip(), payload)
+            try:
+                prompt_queue.put_nowait(payload)
+            except queue.Full:
+                continue
 
 
 @dataclass
@@ -279,6 +302,8 @@ WORKFLOW_STAGE_ACTION_ORDER = {
         start=1,
     )
 }
+RUNNER_DEDUP_ACTIONS = frozenset((*WORKFLOW_STAGE_ACTION_ORDER, "workflow.a00.start"))
+REQUIREMENT_CONCURRENCY_CONFLICT_MARKER = "并发冲突：同项目同需求已有运行中任务"
 
 LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME = ".requirements_analysis_runtime"
 WORKFLOW_RECORD_ROOT_NAME = ".tmux_workflow"
@@ -1004,7 +1029,7 @@ def _normalize_worker_session_state(
             normalized_agent_state = "STARTING"
             if normalized_health_status in {"", "alive", "dead", "missing_session", "pane_dead"}:
                 normalized_health_status = "unknown"
-            if not normalized_health_note or normalized_health_note in {"tmux session missing", "missing_session", "pane_dead"}:
+            if not normalized_health_note or normalized_health_note in {"alive", "tmux session missing", "missing_session", "pane_dead"}:
                 normalized_health_note = "launch pending"
             return normalized_agent_state, normalized_health_status, normalized_health_note
         normalized_agent_state = "DEAD"
@@ -1275,6 +1300,8 @@ class BridgeCore:
             progress_context_provider=self._current_progress_context,
         )
         self._workers: dict[str, threading.Thread] = {}
+        self._worker_registry_lock = threading.Lock()
+        self._running_action_keys: dict[str, str] = {}
         self._controls: dict[str, ControlSessionState] = {}
         self._controls_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
@@ -1880,27 +1907,29 @@ class BridgeCore:
         if self._current_artifact_index_scope() != previous_artifact_scope:
             self._reset_artifact_index_for_current_context()
 
+    @staticmethod
+    def _parse_stage_args_for_action(action: str, argv: Sequence[str]) -> argparse.Namespace | None:
+        normalized = str(action or "").strip()
+        parser_builders = {
+            "workflow.a00.start": build_a00_parser,
+            "stage.a01.start": build_a01_parser,
+            "stage.a02.start": build_a02_parser,
+            "stage.a03.start": build_a03_parser,
+            "stage.a04.start": build_a04_parser,
+            "stage.a05.start": build_a05_parser,
+            "stage.a06.start": build_a06_parser,
+            "stage.a07.start": build_a07_parser,
+            "stage.a08.start": build_a08_parser,
+        }
+        builder = parser_builders.get(normalized)
+        if builder is None:
+            return None
+        return builder().parse_args(list(argv))
+
     def _update_context_from_stage_args(self, action: str, argv: Sequence[str]) -> None:
         try:
-            if action == "workflow.a00.start":
-                args = build_a00_parser().parse_args(list(argv))
-            elif action == "stage.a01.start":
-                args = build_a01_parser().parse_args(list(argv))
-            elif action == "stage.a02.start":
-                args = build_a02_parser().parse_args(list(argv))
-            elif action == "stage.a03.start":
-                args = build_a03_parser().parse_args(list(argv))
-            elif action == "stage.a04.start":
-                args = build_a04_parser().parse_args(list(argv))
-            elif action == "stage.a05.start":
-                args = build_a05_parser().parse_args(list(argv))
-            elif action == "stage.a06.start":
-                args = build_a06_parser().parse_args(list(argv))
-            elif action == "stage.a07.start":
-                args = build_a07_parser().parse_args(list(argv))
-            elif action == "stage.a08.start":
-                args = build_a08_parser().parse_args(list(argv))
-            else:
+            args = self._parse_stage_args_for_action(action, argv)
+            if args is None:
                 return
         except Exception:
             return
@@ -3603,6 +3632,97 @@ class BridgeCore:
         workers = self._filter_workers_for_current_context(self._current_stage_workers(action), action)
         return any(_is_recoverable_reconfig_snapshot(worker) for worker in workers)
 
+    @staticmethod
+    def _is_requirement_concurrency_conflict(error: BaseException) -> bool:
+        return REQUIREMENT_CONCURRENCY_CONFLICT_MARKER in str(error or "")
+
+    @staticmethod
+    def _normalize_action_scope_project(project_dir: str) -> str:
+        text = str(project_dir or "").strip()
+        if not text:
+            return ""
+        try:
+            return str(Path(text).expanduser().resolve())
+        except Exception:
+            return text
+
+    def _runner_dedup_key(self, action: str, argv: Sequence[str] | None) -> str:
+        normalized_action = str(action or "").strip()
+        if normalized_action not in RUNNER_DEDUP_ACTIONS:
+            return ""
+        project_dir = ""
+        requirement_name = ""
+        try:
+            args = self._parse_stage_args_for_action(normalized_action, list(argv or []))
+        except Exception:
+            args = None
+        if args is not None:
+            project_dir = self._normalize_action_scope_project(str(getattr(args, "project_dir", "") or ""))
+            requirement_name = str(getattr(args, "requirement_name", "") or "").strip()
+        return "\0".join((normalized_action, project_dir, requirement_name))
+
+    def _emit_duplicate_runner_response(
+        self,
+        *,
+        request_id: str,
+        action: str,
+        respond: bool,
+        reason: str,
+        stage_seq: int = 0,
+        mark_failed: bool = False,
+    ) -> None:
+        message_text = str(reason or "").strip() or "已有同一任务在运行，本次重复启动已忽略。"
+        self.emit_event(
+            "log.append",
+            {
+                "text": f"{message_text}\n",
+                "log_kind": "warning",
+                "log_title": "duplicate runner ignored",
+            },
+        )
+        failure_record_path = None
+        if mark_failed:
+            failure_record_path = _write_project_stage_failure_record(
+                project_dir=self._resolve_project_dir(),
+                requirement_name=str(self._context.requirement_name or "").strip(),
+                action=action,
+                error=RuntimeError(message_text),
+                traceback_text="",
+            )
+            if failure_record_path is not None:
+                self.emit_event("log.append", {"text": f"阶段失败记录: {failure_record_path}\n"})
+            self.emit_event(
+                "error",
+                {"action": action, "message": message_text, "traceback": ""},
+            )
+            self._emit_display_stage_state(
+                preferred_status="failed",
+                preferred_action=action,
+                preferred_stage_seq=stage_seq,
+                source="runner_failure",
+                failure_path=str(failure_record_path or ""),
+                message=message_text,
+                force=True,
+            )
+        if respond and request_id:
+            self.emit_response(
+                request_id,
+                ok=False,
+                error=message_text,
+                payload={
+                    "accepted": True,
+                    "deferred": True,
+                    "already_running": True,
+                    "action": str(action or "").strip(),
+                    "message": message_text,
+                },
+            )
+        self._emit_snapshot_update(
+            include_app=True,
+            include_artifacts=True,
+            stage_routes=self._stage_routes_for_action(action),
+        )
+
     def _await_manual_reconfiguration_recovery(
         self,
         *,
@@ -3655,6 +3775,24 @@ class BridgeCore:
         respond: bool = True,
     ) -> None:
         worker_key = str(request_id).strip() or f"auto-{action}-{dt.datetime.now().timestamp()}"
+        dedup_key = self._runner_dedup_key(action, argv)
+        duplicate_running = False
+        if dedup_key:
+            with self._worker_registry_lock:
+                existing_worker_key = self._running_action_keys.get(dedup_key, "")
+                existing_worker = self._workers.get(existing_worker_key)
+                if existing_worker is not None and existing_worker.is_alive():
+                    duplicate_running = True
+                if existing_worker_key and not duplicate_running:
+                    self._running_action_keys.pop(dedup_key, None)
+        if duplicate_running:
+            self._emit_duplicate_runner_response(
+                request_id=request_id,
+                action=action,
+                respond=respond,
+                reason="已有同一任务在运行，本次重复启动已忽略。",
+            )
+            return
 
         def target() -> None:
             stage_seq = self._allocate_stage_seq()
@@ -3708,6 +3846,16 @@ class BridgeCore:
                         respond=respond,
                     )
                     return
+                if self._is_requirement_concurrency_conflict(error):
+                    self._emit_duplicate_runner_response(
+                        request_id=request_id,
+                        action=final_action or action,
+                        respond=respond,
+                        reason=f"{error}\n已检测到同项目同需求已有运行中任务，本次启动已终止。",
+                        stage_seq=final_stage_seq,
+                        mark_failed=True,
+                    )
+                    return
                 if self._manual_reconfiguration_error_pending(action=final_action or action, error=error):
                     self._await_manual_reconfiguration_recovery(
                         request_id=request_id,
@@ -3758,12 +3906,18 @@ class BridgeCore:
                     stage_routes=self._stage_routes_for_action(final_action or action),
                 )
             finally:
-                self._workers.pop(worker_key, None)
+                with self._worker_registry_lock:
+                    self._workers.pop(worker_key, None)
+                    if dedup_key and self._running_action_keys.get(dedup_key) == worker_key:
+                        self._running_action_keys.pop(dedup_key, None)
 
         # Stage runners own process-wide resources such as flock-based requirement locks.
         # Keep them non-daemon so interpreter shutdown cannot interrupt their finally blocks.
         thread = threading.Thread(target=target, name=f"tui-backend-{action}-{request_id}", daemon=False)
-        self._workers[worker_key] = thread
+        with self._worker_registry_lock:
+            self._workers[worker_key] = thread
+            if dedup_key:
+                self._running_action_keys[dedup_key] = worker_key
         thread.start()
 
     def _get_control_session(self, control_id: str) -> ControlSessionState:
@@ -3815,6 +3969,72 @@ class BridgeCore:
                     cleaned_sessions.append(cleaned_session)
         return sorted(set(cleaned_sessions))
 
+    @staticmethod
+    def _path_is_within_project(path_value: str, project_root: Path) -> bool:
+        if not str(path_value or "").strip():
+            return True
+        try:
+            candidate = Path(path_value).expanduser().resolve()
+        except Exception:
+            return False
+        return candidate == project_root or project_root in candidate.parents
+
+    def _project_runtime_roots(self, project_root: Path) -> tuple[Path, ...]:
+        root_names = (
+            ROUTING_RUNTIME_ROOT_NAME,
+            NOTION_RUNTIME_ROOT_NAME,
+            REQUIREMENTS_RUNTIME_ROOT_NAME,
+            LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME,
+            REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+            DETAILED_DESIGN_RUNTIME_ROOT_NAME,
+            TASK_SPLIT_RUNTIME_ROOT_NAME,
+            DEVELOPMENT_RUNTIME_ROOT_NAME,
+        )
+        return tuple(project_root / name for name in root_names)
+
+    def _cleanup_project_runtime_tmux_workers(self, *, reason: str) -> list[str]:
+        _ = reason
+        project_dir = str(self._resolve_project_dir() or "").strip()
+        if not project_dir:
+            return []
+        try:
+            project_root = Path(project_dir).expanduser().resolve()
+        except Exception:
+            return []
+        cleaned_sessions: list[str] = []
+        seen_sessions: set[str] = set()
+        for runtime_root in self._project_runtime_roots(project_root):
+            if not runtime_root.exists() or not runtime_root.is_dir():
+                continue
+            for state_path in sorted(runtime_root.glob("**/worker.state.json")):
+                try:
+                    if "_locks" in state_path.relative_to(runtime_root).parts:
+                        continue
+                except ValueError:
+                    pass
+                payload = _safe_json_read(state_path)
+                if not payload:
+                    continue
+                payload_project = str(payload.get("project_dir", "") or "").strip()
+                payload_work_dir = str(payload.get("work_dir", "") or "").strip()
+                if payload_project and not self._path_is_within_project(payload_project, project_root):
+                    continue
+                if payload_work_dir and not self._path_is_within_project(payload_work_dir, project_root):
+                    continue
+                session_name = str(payload.get("session_name", "") or "").strip()
+                if not session_name or session_name in seen_sessions:
+                    continue
+                seen_sessions.add(session_name)
+                try:
+                    if not self._tmux_runtime.session_exists(session_name):
+                        continue
+                    cleaned_session = self._tmux_runtime.kill_session(session_name, missing_ok=True)
+                except Exception:
+                    continue
+                if cleaned_session:
+                    cleaned_sessions.append(cleaned_session)
+        return sorted(set(cleaned_sessions))
+
     def shutdown(self, *, cleanup_tmux: bool) -> list[str]:
         with self._shutdown_lock:
             if self._shutdown_started:
@@ -3827,6 +4047,7 @@ class BridgeCore:
             self._snapshot_dirty_stage_routes.clear()
         if timer is not None:
             timer.cancel()
+        self._prompt_broker.shutdown()
         self._attention_manager.shutdown()
         with self._controls_lock:
             sessions = list(self._controls.values())
@@ -3842,6 +4063,7 @@ class BridgeCore:
                 set(
                     cleanup_registered_tmux_workers(reason="tui_backend_shutdown")
                     + self._cleanup_visible_tmux_workers(reason="tui_backend_shutdown")
+                    + self._cleanup_project_runtime_tmux_workers(reason="tui_backend_shutdown")
                 )
             )
             if cleaned_sessions:

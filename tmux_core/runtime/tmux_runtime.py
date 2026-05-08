@@ -177,7 +177,30 @@ def worker_state_has_launch_evidence(source: Mapping[str, object] | object | Non
     payload = _worker_state_payload(source)
     if _truthy_runtime_flag(payload.get("agent_started")) or _truthy_runtime_flag(payload.get("agent_ready")):
         return True
-    return bool(str(payload.get("pane_id", "") or "").strip())
+    if not str(payload.get("pane_id", "") or "").strip():
+        return False
+    if _worker_state_is_session_created_prelaunch(payload):
+        return False
+    return True
+
+
+def _worker_state_is_session_created_prelaunch(payload: Mapping[str, object]) -> bool:
+    if _truthy_runtime_flag(payload.get("agent_started")) or _truthy_runtime_flag(payload.get("agent_ready")):
+        return False
+    if str(payload.get("note", "") or "").strip().lower() != "session_created":
+        return False
+    agent_state = str(payload.get("agent_state", "") or "").strip().upper()
+    if agent_state not in {"", "STARTING", "DEAD"}:
+        return False
+    workflow_stage = str(payload.get("workflow_stage", "") or "").strip().lower()
+    if workflow_stage and workflow_stage not in PRELAUNCH_WORKFLOW_STAGES:
+        return False
+    statuses = {
+        str(payload.get(field_name, "") or "").strip().lower()
+        for field_name in ("status", "result_status")
+    }
+    statuses.discard("")
+    return bool(statuses & PRELAUNCH_ACTIVE_RESULT_STATUSES) and not bool(statuses & TERMINAL_WORKER_RESULT_STATUSES)
 
 
 def worker_state_is_prelaunch_active(source: Mapping[str, object] | object | None) -> bool:
@@ -208,10 +231,10 @@ def worker_state_is_prelaunch_active(source: Mapping[str, object] | object | Non
     return bool(statuses & PRELAUNCH_ACTIVE_RESULT_STATUSES)
 
 
-BRAILLE_SPINNER_PREFIX_RE = re.compile(rf"^[{BRAILLE_SPINNER_CHARS}]\s+")
+BRAILLE_SPINNER_PREFIX_RE = re.compile(rf"^[{BRAILLE_SPINNER_CHARS}]")
 CLAUDE_BUSY_TITLE_PREFIX_RE = re.compile(rf"^[{re.escape(CLAUDE_BUSY_TITLE_CHARS)}]\s+")
 CLAUDE_READY_PATTERNS = (
-    r"^\s*❯\s*$",
+    r"^\s*❯(?:[\s\u00a0].*)?$",
 )
 CLAUDE_BUSY_PATTERNS = (
     r"\bNesting…",
@@ -251,9 +274,6 @@ CODEX_UPDATE_NOTICE_PATTERNS = (
 CODEX_STARTING_PATTERNS = (
     r"Starting MCP servers",
     r"MCP servers \(\d+/\d+\)",
-)
-CODEX_BUSY_PATTERNS = (
-    r"\besc to interrupt\b",
 )
 GEMINI_READY_PATTERNS = (
     r"Type your message",
@@ -333,9 +353,25 @@ def _codex_effective_recent_surface(text: str, *, max_lines: int = 120) -> str:
     return "\n".join(lines[start_index:])
 
 
+def _codex_surface_indicates_ready_prompt(text: str) -> bool:
+    surface = str(text or "")
+    if not surface.strip():
+        return False
+    if not any(re.search(pattern, surface, re.IGNORECASE | re.MULTILINE) for pattern in CODEX_READY_PATTERNS):
+        return False
+    return not any(
+        re.search(pattern, surface, re.IGNORECASE)
+        for pattern in (
+            *CODEX_STARTING_PATTERNS,
+            *CODEX_TRUST_PROMPT_PATTERNS,
+            *CODEX_MODEL_SELECTION_PROMPT_PATTERNS,
+        )
+    )
+
+
 def _claude_title_indicates_ready(pane_title: str) -> bool:
     title = str(pane_title or "").strip()
-    return title == CLAUDE_READY_TITLE or title.startswith(f"{CLAUDE_READY_TITLE} ")
+    return bool(re.match(r"^✳(?:[\s\u00a0]|$)", title))
 
 
 def _claude_title_indicates_busy(pane_title: str) -> bool:
@@ -1797,32 +1833,15 @@ class BaseOutputDetector:
 
 class CodexOutputDetector(BaseOutputDetector):
     def classify_agent_state(self, observation: WorkerObservation) -> AgentRuntimeState:
-        visible_text = self.current_visible_text(observation)
-        recent_log = self.recent_log_text(observation)
-        text = self.observation_text(observation)
         base_state = super().classify_agent_state(observation)
-        if base_state != AgentRuntimeState.BUSY:
+        if base_state == AgentRuntimeState.DEAD:
             return base_state
-        visible_surface = _codex_effective_recent_surface(visible_text or text)
-        busy_surface = _codex_effective_recent_surface(visible_text or recent_log or text)
-        ready_visible = self._contains_any(visible_surface, CODEX_READY_PATTERNS)
-        busy_visible = self._contains_any(busy_surface, CODEX_BUSY_PATTERNS)
-        if self._contains_any(visible_surface, CODEX_TRUST_PROMPT_PATTERNS):
+        title = str(observation.pane_title or "").strip()
+        if not title:
             return AgentRuntimeState.STARTING
-        if ready_visible and not busy_visible and not self._contains_any(visible_surface, CODEX_STARTING_PATTERNS):
-            return AgentRuntimeState.READY
-        if self._contains_any(visible_surface, CODEX_UPDATE_NOTICE_PATTERNS) or self._contains_any(
-            visible_surface,
-            CODEX_MODEL_SELECTION_PROMPT_PATTERNS,
-        ):
-            return AgentRuntimeState.STARTING
-        if self._contains_any(visible_surface, CODEX_STARTING_PATTERNS):
-            return AgentRuntimeState.STARTING if observation.current_command else AgentRuntimeState.DEAD
-        if busy_visible:
+        if BRAILLE_SPINNER_PREFIX_RE.match(title):
             return AgentRuntimeState.BUSY
-        if ready_visible:
-            return AgentRuntimeState.READY
-        return AgentRuntimeState.BUSY
+        return AgentRuntimeState.READY
 
     def extract_last_message(self, output: str) -> str:
         clean_output = clean_ansi(output)
@@ -1855,10 +1874,10 @@ class ClaudeOutputDetector(BaseOutputDetector):
             return AgentRuntimeState.DEAD
         if _claude_title_indicates_busy(observation.pane_title):
             return AgentRuntimeState.BUSY
-        if self._contains_any(visible_text or recent_log or text, CLAUDE_BUSY_PATTERNS):
-            return AgentRuntimeState.BUSY
         if _claude_title_indicates_ready(observation.pane_title):
             return AgentRuntimeState.READY
+        if self._contains_any(visible_text or recent_log or text, CLAUDE_BUSY_PATTERNS):
+            return AgentRuntimeState.BUSY
         if self._has_turn_token(text):
             return AgentRuntimeState.READY
         if self._contains_any(visible_text or recent_log or text, CLAUDE_READY_PATTERNS):
@@ -2000,15 +2019,6 @@ def classify_agent_runtime_state(
     if context.title_ready:
         return AgentRuntimeState.READY
     if context.title_busy:
-        if (
-                context.vendor == Vendor.CODEX
-                and not context.task_running
-                and str(observation.visible_text or "").strip()
-                and not str(observation.raw_log_tail or "").strip()
-        ):
-            detected_state = detector.classify_agent_state(observation)
-            if detected_state != AgentRuntimeState.BUSY:
-                return detected_state
         return AgentRuntimeState.BUSY
     if (
             context.vendor == Vendor.OPENCODE
@@ -2820,11 +2830,7 @@ class TmuxBatchWorker:
         if not self._agent_running(current_command):
             return False
         if self.config.vendor == Vendor.CODEX:
-            if self._title_indicates_ready(observation.pane_title):
-                return False
-            if self._title_indicates_busy(observation.pane_title):
-                return True
-            return self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
+            return False
         if self.config.vendor == Vendor.CLAUDE:
             if self._title_indicates_ready(observation.pane_title):
                 return False
@@ -4087,7 +4093,7 @@ class TmuxBatchWorker:
             return False
         recent_output = "\n".join(str(visible_text or "").splitlines()[-80:])
         effective_output = _codex_effective_recent_surface(recent_output, max_lines=80)
-        if effective_output != recent_output and self._visible_indicates_agent_ready(effective_output):
+        if effective_output != recent_output and _codex_surface_indicates_ready_prompt(effective_output):
             return False
         if re.search(r"Press enter to continue", recent_output, re.IGNORECASE) and any(
                 re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_TRUST_PROMPT_PATTERNS
@@ -4305,7 +4311,7 @@ class TmuxBatchWorker:
         if not title:
             return False
         if self.config.vendor == Vendor.CODEX:
-            return title in self._codex_title_candidates()
+            return not bool(BRAILLE_SPINNER_PREFIX_RE.match(title))
         if self.config.vendor == Vendor.CLAUDE:
             return _claude_title_indicates_ready(title)
         if self.config.vendor == Vendor.GEMINI:
@@ -4317,9 +4323,7 @@ class TmuxBatchWorker:
         if not title:
             return False
         if self.config.vendor == Vendor.CODEX:
-            return bool(BRAILLE_SPINNER_PREFIX_RE.match(title)) and any(
-                title.endswith(candidate) for candidate in self._codex_title_candidates()
-            )
+            return bool(BRAILLE_SPINNER_PREFIX_RE.match(title))
         if self.config.vendor == Vendor.CLAUDE:
             return _claude_title_indicates_busy(title)
         if self.config.vendor == Vendor.GEMINI:
@@ -4358,7 +4362,7 @@ class TmuxBatchWorker:
     def _is_prelaunch_without_session(self) -> bool:
         if self.agent_started:
             return False
-        if str(self.pane_id or "").strip():
+        if str(self.pane_id or "").strip() and not worker_state_is_prelaunch_active(self.read_state()):
             return False
         try:
             return not self.session_exists()
@@ -4459,12 +4463,7 @@ class TmuxBatchWorker:
             return False
         if self.config.vendor == Vendor.CODEX:
             recent_output = _codex_effective_recent_surface(recent_output)
-            if (
-                    any(re.search(pattern, recent_output, re.IGNORECASE | re.MULTILINE) for pattern in CODEX_READY_PATTERNS)
-                    and not any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_STARTING_PATTERNS)
-                    and not any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_TRUST_PROMPT_PATTERNS)
-                    and not any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_MODEL_SELECTION_PROMPT_PATTERNS)
-            ):
+            if _codex_surface_indicates_ready_prompt(recent_output):
                 return False
             return any(
                 re.search(pattern, recent_output, re.IGNORECASE)
@@ -4503,16 +4502,7 @@ class TmuxBatchWorker:
         if not recent_output.strip():
             return False
         if self.config.vendor == Vendor.CODEX:
-            recent_output = _codex_effective_recent_surface(recent_output)
-            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_TRUST_PROMPT_PATTERNS):
-                return False
-            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_MODEL_SELECTION_PROMPT_PATTERNS):
-                return False
-            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_STARTING_PATTERNS):
-                return False
-            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_BUSY_PATTERNS):
-                return False
-            return any(re.search(pattern, recent_output, re.IGNORECASE | re.MULTILINE) for pattern in CODEX_READY_PATTERNS)
+            return False
         if self.config.vendor == Vendor.CLAUDE:
             if any(re.search(pattern, recent_output, re.IGNORECASE | re.MULTILINE) for pattern in CLAUDE_BUSY_PATTERNS):
                 return False
@@ -4559,7 +4549,7 @@ class TmuxBatchWorker:
     ) -> WrapperState:
         if not self._agent_running(current_command):
             return WrapperState.NOT_READY
-        if visible_text and self._visible_indicates_agent_starting(visible_text):
+        if self.config.vendor != Vendor.CODEX and visible_text and self._visible_indicates_agent_starting(visible_text):
             return WrapperState.NOT_READY
         if self.terminal_recently_changed:
             return WrapperState.NOT_READY

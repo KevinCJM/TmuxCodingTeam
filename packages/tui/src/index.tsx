@@ -1,9 +1,10 @@
 import { createCliRenderer } from '@opentui/core'
 import { render } from '@opentui/solid'
-import { App } from './app'
+import { App, stopBackendClient } from './app'
 import { copyToClipboard } from './clipboard'
 
 type StartupRoute = 'home' | 'routing' | 'requirements' | 'review' | 'design' | 'task-split' | 'development' | 'overall-review' | 'control'
+type ShutdownSignal = 'SIGINT' | 'SIGTERM' | 'SIGHUP'
 
 function parseStartupArgs(argv: string[]) {
   let route: StartupRoute | undefined
@@ -56,8 +57,9 @@ function parseStartupArgs(argv: string[]) {
 
 const renderer = await createCliRenderer({
   targetFps: 60,
-  exitOnCtrlC: true,
+  exitOnCtrlC: false,
   useMouse: true,
+  useKittyKeyboard: { disambiguate: true, alternateKeys: true, allKeysAsEscapes: true },
   autoFocus: true,
   screenMode: 'alternate-screen',
   externalOutputMode: 'passthrough',
@@ -71,6 +73,33 @@ const renderer = await createCliRenderer({
     },
   },
 })
+
+let shutdownStarted = false
+
+function exitCodeForSignal(signal: ShutdownSignal) {
+  if (signal === 'SIGINT') return 130
+  if (signal === 'SIGTERM') return 143
+  if (signal === 'SIGHUP') return 129
+  return 1
+}
+
+async function shutdownFromSignal(signal: ShutdownSignal) {
+  if (shutdownStarted) return
+  shutdownStarted = true
+  try {
+    renderer.destroy()
+  } catch {
+    // Renderer may already be shutting down.
+  }
+  await stopBackendClient()
+  process.exit(exitCodeForSignal(signal))
+}
+
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+  process.on(signal, () => {
+    void shutdownFromSignal(signal)
+  })
+}
 
 const startup = parseStartupArgs(Bun.argv.slice(2))
 

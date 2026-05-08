@@ -846,6 +846,10 @@ async function runInheritedCommand(renderer: ReturnType<typeof useRenderer>, com
 
 const client = new BackendClient()
 
+export function stopBackendClient(forceKillAfterMs?: number) {
+  return client.stop(forceKillAfterMs)
+}
+
 export function App(props: StartupOptions) {
   const renderer = useRenderer()
   const dimensions = useTerminalDimensions()
@@ -1287,7 +1291,7 @@ export function App(props: StartupOptions) {
     onCleanup(() => clearInterval(spinnerTimer))
     onCleanup(() => {
       unsubscribeBackend?.()
-      client.stop()
+      void client.stop()
     })
     try {
       await client.start()

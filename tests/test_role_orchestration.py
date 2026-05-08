@@ -368,6 +368,21 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertIs(current_main, main)
         self.assertEqual([item.reviewer_name for item in updated], ["replacement"])
 
+    def test_run_reviewer_phase_with_death_handling_does_not_block_on_stale_reviewer(self):
+        main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
+        reviewer = SimpleNamespace(worker=_ActiveFailedBusyWorker(), reviewer_name="测试工程师")
+
+        updated, current_main = run_reviewer_phase_with_death_handling(
+            main,
+            [reviewer],
+            run_phase=lambda reviewers: list(reviewers),
+            replace_dead_main_owner=lambda owner: owner,
+            reviewer_label_getter=lambda item, _index: item.reviewer_name,
+        )
+
+        self.assertIs(current_main, main)
+        self.assertEqual(updated, [reviewer])
+
 
 if __name__ == "__main__":
     unittest.main()

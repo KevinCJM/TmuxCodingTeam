@@ -8,6 +8,7 @@ type Props = {
   focused?: boolean
   multiline?: boolean
   hintLines?: string[]
+  onBack?: () => void
   onSubmit: (value: string) => void
 }
 
@@ -22,6 +23,7 @@ export function DialogPrompt(props: Props) {
       mode={props.multiline ? 'multiline' : 'singleline'}
       hintLines={props.hintLines}
       showSubmitHelper={Boolean(props.multiline)}
+      onBack={props.onBack}
       onSubmit={props.onSubmit}
     />
   )
