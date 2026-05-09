@@ -1,13 +1,39 @@
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from typing import Callable, Sequence, TypeVar
 
 from tmux_core.runtime.tmux_runtime import DEFAULT_COMMAND_TIMEOUT_SEC, worker_state_is_prelaunch_active
 from tmux_core.stage_kernel.agent_intervention import render_worker_intervention_summary
 
+READY_STABILIZATION_GRACE_SEC = 10.0
+READY_STARTUP_STABILIZATION_GRACE_SEC = 60.0
+READY_STABILIZATION_POLL_SEC = 0.25
+
 TMain = TypeVar("TMain")
 TReviewer = TypeVar("TReviewer")
 TResult = TypeVar("TResult")
+
+
+@dataclass
+class WorkerReadyCheckFailed(RuntimeError):
+    role_label: str
+    worker: object | None
+    state_name: str
+    reason_text: str
+    stage_label: str = "阶段调度"
+
+    def __post_init__(self) -> None:
+        RuntimeError.__init__(
+            self,
+            render_worker_intervention_summary(
+                stage_label=self.stage_label,
+                role_label=self.role_label,
+                worker=self.worker,
+                reason_text=self.reason_text,
+            ),
+        )
 
 
 def _resolve_worker(owner: object | None):
@@ -65,6 +91,14 @@ def _current_turn_completed(worker: object) -> bool:
     return status == "succeeded" and result_status == "succeeded" and runtime_status == "done"
 
 
+def _current_task_running(worker: object) -> bool:
+    state = _read_worker_state(worker)
+    runtime_status = str(
+        state.get("current_task_runtime_status", getattr(worker, "current_task_runtime_status", "")) or ""
+    ).strip().lower()
+    return runtime_status == "running"
+
+
 def _worker_failed_or_stale(worker: object) -> bool:
     state = _read_worker_state(worker)
     if worker_state_is_prelaunch_active(state or worker):
@@ -91,6 +125,37 @@ def _failed_worker_is_still_active(worker: object, state_name: str) -> bool:
     return bool(state.get("terminal_recently_changed", False))
 
 
+def _state_allows_ready_stabilization(worker: object, state_name: str) -> bool:
+    if str(state_name or "").strip().upper() not in {"BUSY", "STARTING"}:
+        return False
+    state = _read_worker_state(worker)
+    health_status = str(state.get("health_status", getattr(worker, "health_status", "")) or "").strip().lower()
+    return health_status not in {"dead", "missing_session", "pane_dead", "provider_runtime_error"}
+
+
+def _ready_stabilization_grace_sec(worker: object, state_name: str) -> float:
+    normalized = str(state_name or "").strip().upper()
+    if normalized in {"BUSY", "STARTING"} and not _current_task_running(worker):
+        return max(READY_STABILIZATION_GRACE_SEC, READY_STARTUP_STABILIZATION_GRACE_SEC)
+    return READY_STABILIZATION_GRACE_SEC
+
+
+def _wait_for_ready_stabilization(
+    worker: object,
+    *,
+    grace_sec: float = READY_STABILIZATION_GRACE_SEC,
+    poll_sec: float = READY_STABILIZATION_POLL_SEC,
+) -> str:
+    deadline = time.monotonic() + max(0.0, grace_sec)
+    state_name = _state_name(worker)
+    while state_name != "READY" and _state_allows_ready_stabilization(worker, state_name):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(max(0.0, poll_sec))
+        state_name = _state_name(worker)
+    return state_name
+
+
 def _restart_failed_worker_before_ready_wait(worker: object, *, timeout_sec: float) -> bool:
     _ = timeout_sec
     return False
@@ -112,20 +177,34 @@ def _ensure_worker_ready(
         return
     state_name = _state_name(worker)
     if _worker_failed_or_stale(worker) and state_name != "READY" and not _failed_worker_is_still_active(worker, state_name):
-        raise RuntimeError(
-            render_worker_intervention_summary(
-                stage_label="阶段调度",
-                role_label=role_label,
-                worker=worker,
-                reason_text="上一轮执行失败或状态异常，系统不会自动重启该智能体。请人工进入 tmux 检查后再继续。",
-            )
+        raise WorkerReadyCheckFailed(
+            role_label=role_label,
+            worker=worker,
+            state_name=state_name,
+            reason_text="上一轮执行失败或状态异常，系统不会自动重启该智能体。请人工进入 tmux 检查后再继续。",
         )
     if state_name != "READY":
-        ensure_ready(timeout_sec=timeout_sec)
+        try:
+            ensure_ready(timeout_sec=timeout_sec)
+        except Exception as error:  # noqa: BLE001
+            raise WorkerReadyCheckFailed(
+                role_label=role_label,
+                worker=worker,
+                state_name=_state_name(worker),
+                reason_text=f"等待智能体 READY 时发生异常: {error}",
+            ) from error
     if allow_completed_nonready and _current_turn_completed(worker):
         return
-    if _state_name(worker) != "READY":
-        raise RuntimeError(f"{role_label} 未进入 READY 状态")
+    state_name = _state_name(worker)
+    if state_name != "READY":
+        state_name = _wait_for_ready_stabilization(worker, grace_sec=_ready_stabilization_grace_sec(worker, state_name))
+    if state_name != "READY":
+        raise WorkerReadyCheckFailed(
+            role_label=role_label,
+            worker=worker,
+            state_name=state_name,
+            reason_text=f"{role_label} 未进入 READY 状态（当前状态: {state_name or 'UNKNOWN'}）",
+        )
 
 
 def ensure_main_ready(

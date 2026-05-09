@@ -7,6 +7,7 @@ from typing import Mapping, Sequence
 from T09_terminal_ops import message, prompt_select_option
 
 AGENT_INTERVENTION_RECHECK = "recheck_after_manual_intervention"
+AGENT_INTERVENTION_RECREATE = "recreate_after_manual_intervention"
 AGENT_INTERVENTION_WORKER_DEAD = "worker_dead_after_manual_intervention"
 
 
@@ -92,6 +93,8 @@ def request_worker_manual_intervention(
     reason_text: str,
     target_paths: Sequence[str | Path] = (),
     progress: object | None = None,
+    allow_recreate: bool = False,
+    allow_worker_dead: bool = True,
 ) -> str:
     role_text = str(role_label or "").strip() or "智能体"
     stage_text = str(stage_label or "").strip() or "当前阶段"
@@ -109,13 +112,17 @@ def request_worker_manual_intervention(
         set_phase(f"{stage_text} / 等待人工介入 | {role_text}")
     suspended = getattr(progress, "suspended", None)
     context = suspended() if callable(suspended) else nullcontext()
+    options: list[tuple[str, str]] = [
+        (AGENT_INTERVENTION_RECHECK, "我已进入 tmux/修正文件，重新检查"),
+    ]
+    if allow_recreate:
+        options.append((AGENT_INTERVENTION_RECREATE, "重新创建该智能体"))
+    if allow_worker_dead:
+        options.append((AGENT_INTERVENTION_WORKER_DEAD, "智能体已死亡或已关闭，按死亡处理"))
     with context:
         return prompt_select_option(
             title=f"HITL: {role_text} 需要人工介入",
-            options=(
-                (AGENT_INTERVENTION_RECHECK, "我已进入 tmux/修正文件，重新检查"),
-                (AGENT_INTERVENTION_WORKER_DEAD, "智能体已死亡或已关闭，按死亡处理"),
-            ),
+            options=tuple(options),
             default_value=AGENT_INTERVENTION_RECHECK,
             prompt_text="请选择恢复方式",
             is_hitl=True,
@@ -141,6 +148,7 @@ def request_file_noncompliance_intervention(
     attempts_used: int,
     target_paths: Sequence[str | Path] = (),
     progress: object | None = None,
+    allow_recreate: bool = False,
 ) -> str:
     reason = (
         f"指定文件连续 {attempts_used} 次修复后仍不符合要求。\n"
@@ -153,4 +161,5 @@ def request_file_noncompliance_intervention(
         reason_text=reason,
         target_paths=target_paths,
         progress=progress,
+        allow_recreate=allow_recreate,
     )

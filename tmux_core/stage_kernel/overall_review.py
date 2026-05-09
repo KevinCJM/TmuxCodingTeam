@@ -91,6 +91,7 @@ from tmux_core.stage_kernel.shared_review import (
     mark_worker_awaiting_reconfiguration,
     note_reviewer_failure,
     parse_review_max_rounds,
+    prompt_review_max_rounds,
     resolve_stage_agent_config,
     reviewer_requires_manual_model_reconfiguration,
     worker_has_provider_auth_error,
@@ -148,7 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def resolve_overall_review_max_rounds(args: argparse.Namespace) -> int | None:
+def resolve_overall_review_max_rounds(
+    args: argparse.Namespace,
+    *,
+    progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
+) -> int | None:
     explicit = getattr(args, "review_max_rounds", "")
     if str(explicit or "").strip():
         return parse_review_max_rounds(
@@ -156,7 +162,17 @@ def resolve_overall_review_max_rounds(args: argparse.Namespace) -> int | None:
             source="--review-max-rounds",
             default=MAX_OVERALL_REVIEW_ROUNDS,
         )
-    return MAX_OVERALL_REVIEW_ROUNDS
+    if not stdin_is_interactive():
+        return MAX_OVERALL_REVIEW_ROUNDS
+    if progress is not None and hasattr(progress, "set_phase"):
+        progress.set_phase("整体复核 / 配置最大审核轮次")
+    return prompt_review_max_rounds(
+        default=MAX_OVERALL_REVIEW_ROUNDS,
+        progress=progress,
+        allow_back=allow_back,
+        stage_key="overall_review",
+        stage_step_index=3,
+    )
 
 
 def _review_line_is_nonblocking_ambiguity(line: str) -> bool:
@@ -1535,6 +1551,14 @@ def repair_overall_review_outputs(
         final_error="复核阶段审核智能体多次修复后仍未按协议更新文档",
         stage_label=OVERALL_REVIEW_TASK_NAME,
         progress=progress,
+        recreate_reviewer=lambda reviewer: recreate_development_reviewer_runtime(
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            reviewer=reviewer,
+            reviewer_spec=reviewer_specs_by_name[reviewer.reviewer_name],
+            progress=progress,
+            force_model_change=False,
+        ),
     )
 
 
@@ -1712,7 +1736,17 @@ def run_overall_review_stage(
 
         developer_initialized = False
         round_index = 1
-        review_round_policy = ReviewRoundPolicy(resolve_overall_review_max_rounds(args))
+        review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and not str(getattr(args, "review_max_rounds", "") or "").strip(),
+        )
+        review_round_policy = ReviewRoundPolicy(
+            resolve_overall_review_max_rounds(
+                args,
+                progress=progress,
+                allow_back=review_round_allow_back,
+            )
+        )
         previous_review_msg = ""
         code_change_msg = ""
         while True:

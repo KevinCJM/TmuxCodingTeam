@@ -11,6 +11,7 @@ type Props = {
   title: string
   options: SelectOption[]
   defaultValue?: string
+  hintLines?: string[]
   active?: boolean
   onSubmit: (value: string) => void
 }
@@ -102,6 +103,13 @@ export function DialogSelect(props: Props) {
   return (
     <box flexDirection="column" gap={1} paddingLeft={1} paddingRight={1} width="100%">
       <text>{props.title}</text>
+      <Show when={(props.hintLines ?? []).length > 0}>
+        <box flexDirection="column" width="100%">
+          <For each={props.hintLines ?? []}>
+            {(line) => <text fg="#f7c948" overflow="hidden" wrapMode="none">{line}</text>}
+          </For>
+        </box>
+      </Show>
       <Show
         when={shouldScroll()}
         fallback={

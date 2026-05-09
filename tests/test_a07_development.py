@@ -290,6 +290,36 @@ class A07DevelopmentTests(unittest.TestCase):
             self.assertEqual(paths["merged_review_path"].read_text(encoding="utf-8"), "")
             self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), [{"task_name": "M1-T3", "review_pass": True}])
 
+    def test_prepare_review_round_artifacts_can_force_clear_existing_task_review(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            paths["merged_review_path"].write_text("stale", encoding="utf-8")
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天寿星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-天寿星.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-天寿星.json",
+                contract=_dummy_contract(),
+            )
+            reviewer.review_md_path.write_text("旧失败结论", encoding="utf-8")
+            reviewer.review_json_path.write_text(
+                json.dumps([{"task_name": "M1-T3", "review_pass": False}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            prepare_review_round_artifacts(
+                paths,
+                [reviewer],
+                task_name="M1-T3",
+                preserve_existing_outputs=False,
+            )
+
+            self.assertEqual(paths["merged_review_path"].read_text(encoding="utf-8"), "")
+            self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), "")
+            self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), [])
+
     def test_development_review_human_override_detector_requires_scope_and_context(self):
         self.assertTrue(
             _development_review_human_override_requested(
@@ -556,6 +586,48 @@ class A07DevelopmentTests(unittest.TestCase):
                 )
 
         self.assertIs(result, reviewer)
+
+    def test_reviewer_turn_can_force_rerun_existing_valid_output(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                reviewer_key="测试工程师",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+                worker=_LiveReadyWorker(session_name="测试工程师-天寿星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-天寿星.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-天寿星.json",
+                contract=_dummy_contract(),
+            )
+            reviewer.review_md_path.write_text("", encoding="utf-8")
+            reviewer.review_json_path.write_text(
+                json.dumps([{"task_name": "M1-T3", "review_pass": True}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch("A07_Development.run_completion_turn_with_repair", return_value={}) as run_turn:
+                result = run_reviewer_turn_with_recreation(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    task_name="M1-T3",
+                    reviewer_spec=reviewer_spec,
+                    paths=paths,
+                    reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                    label="development_review_again_M1-T3_测试工程师_round_2",
+                    allow_existing_outputs=False,
+                )
+
+            self.assertIs(result, reviewer)
+            run_turn.assert_called_once()
+            self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), "")
+            self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), [])
 
     def test_reviewer_protocol_repair_prompt_uses_check_reviewer_job_for_exact_paths(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2247,6 +2319,7 @@ class A07DevelopmentTests(unittest.TestCase):
 
         self.assertTrue(result.completed)
         self.assertEqual(parallel_reviewers.call_count, 2)
+        self.assertIs(parallel_reviewers.call_args_list[1].kwargs.get("allow_existing_outputs"), False)
         refine_task.assert_called_once()
 
     def test_run_development_stage_recreates_workers_before_next_task_when_turn_limit_reached(self):

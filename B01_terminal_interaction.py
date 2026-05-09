@@ -648,6 +648,10 @@ class AgentInitControlCenter:
                     "answer_path": str(artifact_bundle.get("answer_path", "")).strip(),
                     "artifact_paths": artifact_paths,
                     "last_heartbeat_at": str(getattr(entry, "last_heartbeat_at", "") or "").strip(),
+                    "vendor": self.config.vendor.value,
+                    "model": self.config.model,
+                    "resolved_model": self.config.resolved_model,
+                    "reasoning_effort": self.config.reasoning_effort,
                 }
             )
         return snapshots

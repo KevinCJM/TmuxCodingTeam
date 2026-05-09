@@ -73,6 +73,7 @@ from tmux_core.stage_kernel.death_orchestration import (
     run_reviewer_phase_with_death_handling,
 )
 from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_RECREATE,
     AGENT_INTERVENTION_WORKER_DEAD,
     request_worker_manual_intervention,
 )
@@ -2117,10 +2118,11 @@ def run_reviewer_turn_with_recreation(
     progress: ReviewStageProgress | None = None,
     can_skip_ready_timeout: bool = True,
     ready_timeout_skip_budget: _ReadyTimeoutSkipBudget | None = None,
+    allow_existing_outputs: bool = True,
 ) -> ReviewerRuntime | None:
     current_reviewer = reviewer
     while True:
-        if _reviewer_has_materialized_outputs(current_reviewer, task_name):
+        if allow_existing_outputs and _reviewer_has_materialized_outputs(current_reviewer, task_name):
             return current_reviewer
         ensure_review_artifacts(current_reviewer.review_md_path, current_reviewer.review_json_path)
         baseline_signature = _reviewer_artifact_signature(current_reviewer)
@@ -2312,6 +2314,7 @@ def _run_parallel_reviewers(
     prompt_builder,
     label_prefix: str,
     progress: ReviewStageProgress | None = None,
+    allow_existing_outputs: bool = True,
 ) -> list[ReviewerRuntime]:
     if progress is not None:
         progress.set_phase(f"任务开发 / {task_name} 评审第 {round_index} 轮")
@@ -2332,6 +2335,7 @@ def _run_parallel_reviewers(
             progress=progress,
             can_skip_ready_timeout=True,
             ready_timeout_skip_budget=skip_budget,
+            allow_existing_outputs=allow_existing_outputs,
         )
 
     return run_parallel_reviewer_round(
@@ -2391,6 +2395,14 @@ def repair_reviewer_outputs(
         final_error="代码评审智能体多次修复后仍未按协议更新文档",
         stage_label="任务开发",
         progress=progress,
+        recreate_reviewer=lambda reviewer: recreate_development_reviewer_runtime(
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            reviewer=reviewer,
+            reviewer_spec=reviewer_specs_by_name[reviewer.reviewer_name],
+            progress=progress,
+            force_model_change=False,
+        ),
     )
 
 
@@ -2401,6 +2413,7 @@ def prepare_review_round_artifacts(
     task_name: str = "",
     audit_context: StageAuditRunContext | None = None,
     review_round_index: int | None = None,
+    preserve_existing_outputs: bool = True,
 ) -> None:
     if audit_context is not None:
         record_before_cleanup(
@@ -2414,7 +2427,7 @@ def prepare_review_round_artifacts(
         )
     ensure_empty_file(paths["merged_review_path"])
     for reviewer in reviewers:
-        if task_name and _reviewer_has_materialized_outputs(reviewer, task_name):
+        if preserve_existing_outputs and task_name and _reviewer_has_materialized_outputs(reviewer, task_name):
             continue
         ensure_review_artifacts(reviewer.review_md_path, reviewer.review_json_path)
 
@@ -3435,6 +3448,7 @@ def run_development_stage(
                         task_name=next_task,
                         audit_context=audit_context,
                         review_round_index=round_index,
+                        preserve_existing_outputs=False,
                     )
                     reviewer_workers, developer = run_reviewer_phase_with_death_handling(
                         developer,
@@ -3458,8 +3472,10 @@ def run_development_stage(
                             ),
                             label_prefix=f"development_review_again_{sanitize_requirement_name(next_task)}",
                             progress=progress,
+                            allow_existing_outputs=False,
                         ),
                         replace_dead_main_owner=replace_dead_developer_owner,
+                        replace_dead_reviewer=replace_dead_reviewer,
                         main_label="开发工程师",
                         reviewer_label_getter=reviewer_label_getter,
                         notify=message,
@@ -3625,8 +3641,10 @@ def run_development_stage(
                     ),
                     target_paths=(paths["task_json_path"], paths["developer_output_path"]),
                     progress=progress,
+                    allow_recreate=True,
+                    allow_worker_dead=False,
                 )
-                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                if decision in {AGENT_INTERVENTION_RECREATE, AGENT_INTERVENTION_WORKER_DEAD}:
                     developer = replace_dead_developer_owner(developer)
                     reviewers_built = False
                     reviewers_initialized = False

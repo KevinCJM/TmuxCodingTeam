@@ -24,6 +24,19 @@ const DISPLAY_SOURCE_ORDER: HomeAgentItem['source'][] = [
 ]
 const DESIGN_REVIEW_ROLE_ORDER = ['开发工程师', '测试工程师', '架构师', '审核员']
 const DEVELOPMENT_REVIEW_ROLE_ORDER = ['需求分析师', '测试工程师', '审核员', '架构师']
+const VENDOR_LABELS: Record<string, string> = {
+  codex: 'Codex',
+  claude: 'Claude',
+  gemini: 'Gemini',
+  opencode: 'OpenCode',
+}
+const EFFORT_LABELS: Record<string, string> = {
+  high: 'High',
+  medium: 'Medium',
+  low: 'Low',
+  minimal: 'Minimal',
+  xhigh: 'XHigh',
+}
 
 type HomeAgentSortEntry = {
   item: HomeAgentItem
@@ -64,6 +77,37 @@ function allowedHomeSources(activeStage: string): ReadonlySet<HomeAgentItem['sou
 function compareText(left: string, right: string): number {
   if (left === right) return 0
   return left < right ? -1 : 1
+}
+
+function titleCase(value: string): string {
+  const text = String(value || '').trim()
+  return text ? text.slice(0, 1).toUpperCase() + text.slice(1) : ''
+}
+
+function formatVendor(value: string): string {
+  const normalized = String(value || '').trim().toLowerCase()
+  return VENDOR_LABELS[normalized] || titleCase(normalized)
+}
+
+function formatModel(value: string): string {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  if (text.toLowerCase().startsWith('gpt-')) return `GPT-${text.slice(4)}`
+  return text
+}
+
+function formatEffort(value: string): string {
+  const normalized = String(value || '').trim().toLowerCase()
+  return EFFORT_LABELS[normalized] || titleCase(normalized)
+}
+
+export function buildAgentConfigLabel(worker: WorkerSnapshot): string {
+  const vendor = formatVendor(worker.vendor || '')
+  const model = formatModel(worker.model || worker.resolvedModel || '')
+  const effort = formatEffort(worker.reasoningEffort || '')
+  if (!vendor && !model && !effort) return ''
+  const modelAndEffort = [model, effort].filter(Boolean).join(', ')
+  return [vendor, modelAndEffort].filter(Boolean).join(' | ')
 }
 
 function workerRoleFromSessionName(sessionName: string): string {
@@ -181,6 +225,7 @@ export function buildHomeAgents(
           sessionName,
           healthStatus: worker.healthStatus || 'unknown',
           agentState: nextAgentState,
+          agentConfigLabel: buildAgentConfigLabel(worker),
           attachCommand: `tmux attach -t ${sessionName}`,
           workDir: worker.workDir,
         },

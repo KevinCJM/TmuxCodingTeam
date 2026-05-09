@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { buildHomeAgents, isRunningWorker, resolveHomeAgentState } from './homeAgents'
+import { buildAgentConfigLabel, buildHomeAgents, isRunningWorker, resolveHomeAgentState } from './homeAgents'
 import type { WorkerSnapshot } from './types'
 
 function worker(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot {
@@ -35,6 +35,24 @@ test('isRunningWorker keeps prelaunch STARTING workers before tmux session exist
   expect(isRunningWorker(worker({ sessionExists: false, agentState: 'STARTING', healthStatus: 'unknown' }))).toBe(true)
 })
 
+test('buildAgentConfigLabel formats vendor model and effort for home display', () => {
+  expect(buildAgentConfigLabel(worker({
+    vendor: 'codex',
+    model: 'gpt-5.5',
+    reasoningEffort: 'high',
+  }))).toBe('Codex | GPT-5.5, High')
+})
+
+test('buildHomeAgents omits config label when worker config is missing', () => {
+  const agents = buildHomeAgents([
+    {
+      source: 'development',
+      workers: [worker({ sessionName: '开发工程师-地雄星', sessionExists: true })],
+    },
+  ])
+  expect(agents[0]?.agentConfigLabel).toBe('')
+})
+
 test('buildHomeAgents prefers newer DEAD snapshot over older READY snapshot for the same session', () => {
   const agents = buildHomeAgents([
     {
@@ -51,6 +69,7 @@ test('buildHomeAgents prefers newer DEAD snapshot over older READY snapshot for 
     source: 'development',
     sessionName: 'sess-1',
     agentState: 'DEAD',
+    agentConfigLabel: '',
   })
 })
 

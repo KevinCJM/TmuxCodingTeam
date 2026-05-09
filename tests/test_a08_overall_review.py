@@ -27,6 +27,7 @@ from A08_OverallReview import (
     ensure_overall_review_inputs,
     normalize_overall_review_reviewer_runtime,
     refine_overall_review_code,
+    resolve_overall_review_max_rounds,
     run_overall_review_stage,
     run_overall_review_turn_with_recreation,
     build_reviewer_workers,
@@ -101,6 +102,28 @@ def _write_required_inputs(paths: dict[str, Path]) -> None:
 
 
 class A08OverallReviewTests(unittest.TestCase):
+    def test_resolve_overall_review_max_rounds_supports_default_and_infinite(self):
+        self.assertEqual(resolve_overall_review_max_rounds(argparse.Namespace(review_max_rounds="")), 5)
+        self.assertIsNone(resolve_overall_review_max_rounds(argparse.Namespace(review_max_rounds="infinite")))
+
+    def test_resolve_overall_review_max_rounds_prompts_with_back_metadata(self):
+        phases: list[str] = []
+        progress = type("Progress", (), {"set_phase": lambda _self, phase: phases.append(phase)})()
+        with patch("A08_OverallReview.stdin_is_interactive", return_value=True), patch(
+            "A08_OverallReview.prompt_review_max_rounds",
+            return_value=None,
+        ) as prompt_mock:
+            value = resolve_overall_review_max_rounds(
+                argparse.Namespace(review_max_rounds=""),
+                progress=progress,
+                allow_back=True,
+            )
+
+        self.assertIsNone(value)
+        self.assertEqual(phases, ["整体复核 / 配置最大审核轮次"])
+        self.assertTrue(prompt_mock.call_args.kwargs["allow_back"])
+        self.assertEqual(prompt_mock.call_args.kwargs["stage_key"], "overall_review")
+
     def test_build_overall_review_reviewer_completion_contract_uses_a08_semantics(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)

@@ -16,6 +16,10 @@ export type WorkerSnapshot = {
   agentState: string
   healthStatus: string
   currentTaskRuntimeStatus?: string
+  vendor?: string
+  model?: string
+  resolvedModel?: string
+  reasoningEffort?: string
   retryCount: number
   note: string
   transcriptPath: string
@@ -116,6 +120,7 @@ export type HitlSnapshot = {
   questionPath: string
   answerPath: string
   summary: string
+  attachCommand: string
 }
 
 export type ArtifactItem = {
@@ -129,6 +134,7 @@ export type HomeAgentItem = {
   sessionName: string
   healthStatus: string
   agentState: string
+  agentConfigLabel: string
   attachCommand: string
   workDir: string
 }

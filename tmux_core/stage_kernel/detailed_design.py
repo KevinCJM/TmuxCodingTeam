@@ -1622,6 +1622,13 @@ def repair_reviewer_outputs(
         final_error="详设审核智能体多次修复后仍未按协议更新文档",
         stage_label=DETAILED_DESIGN_TASK_NAME,
         progress=progress,
+        recreate_reviewer=lambda reviewer: _replace_dead_detailed_design_reviewer(
+            reviewer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            reviewer_specs_by_name=reviewer_specs_by_name,
+            progress=progress,
+        ),
     )
 
 
@@ -1694,6 +1701,26 @@ def _replace_dead_detailed_design_ba(
         ba_display_name = _detailed_design_ba_display_name(project_dir=project_dir, handoff=handoff)
         raise RuntimeError(f"{ba_display_name} 已死亡，且未能重建需求分析师")
     return replacement
+
+
+def _replace_dead_detailed_design_reviewer(
+    reviewer: ReviewerRuntime,
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    reviewer_specs_by_name: dict[str, DetailedDesignReviewerSpec],
+    progress: ReviewStageProgress | None = None,
+) -> ReviewerRuntime | None:
+    reviewer_spec = reviewer_specs_by_name.get(reviewer.reviewer_name)
+    if reviewer_spec is None:
+        return reviewer
+    return recreate_reviewer_runtime(
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+        reviewer=reviewer,
+        reviewer_spec=reviewer_spec,
+        progress=progress,
+    )
 
 
 def _export_reviewer_handoff(
@@ -2209,6 +2236,13 @@ def run_detailed_design_stage(
                         project_dir=project_dir,
                         progress=progress,
                     ),
+                    replace_dead_reviewer=lambda reviewer, _index: _replace_dead_detailed_design_reviewer(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
+                        progress=progress,
+                    ),
                     main_label="详细设计需求分析师",
                     reviewer_label_getter=reviewer_label_getter,
                     notify=message,
@@ -2227,6 +2261,13 @@ def run_detailed_design_stage(
                     replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                         owner,
                         project_dir=project_dir,
+                        progress=progress,
+                    ),
+                    replace_dead_reviewer=lambda reviewer, _index: _replace_dead_detailed_design_reviewer(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
                         progress=progress,
                     ),
                     main_label="详细设计需求分析师",
@@ -2330,6 +2371,13 @@ def run_detailed_design_stage(
                         project_dir=project_dir,
                         progress=progress,
                     ),
+                    replace_dead_reviewer=lambda reviewer, _index: _replace_dead_detailed_design_reviewer(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
+                        progress=progress,
+                    ),
                     main_label="详细设计需求分析师",
                     reviewer_label_getter=reviewer_label_getter,
                     notify=message,
@@ -2348,6 +2396,13 @@ def run_detailed_design_stage(
                     replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                         owner,
                         project_dir=project_dir,
+                        progress=progress,
+                    ),
+                    replace_dead_reviewer=lambda reviewer, _index: _replace_dead_detailed_design_reviewer(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
                         progress=progress,
                     ),
                     main_label="详细设计需求分析师",

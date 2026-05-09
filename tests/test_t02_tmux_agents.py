@@ -34,7 +34,9 @@ from T02_tmux_agents import (
     Vendor,
     TASK_RESULT_CONTRACT_ERROR_PREFIX,
     TURN_ARTIFACT_CONTRACT_ERROR_PREFIX,
+    RuntimeShutdownRequested,
     cleanup_registered_tmux_workers,
+    clear_runtime_shutdown_request,
     build_prompt_header,
     build_proxy_env,
     build_session_name,
@@ -43,6 +45,7 @@ from T02_tmux_agents import (
     list_occupied_tmux_session_names,
     load_worker_from_state_path,
     normalize_proxy_url,
+    request_runtime_shutdown,
     read_text_tail,
     TERMINAL_ACTIVITY_IDLE_WINDOW_SEC,
     _session_name_lease_lock,
@@ -1459,6 +1462,39 @@ workspace (/directory)                                                     branc
             self.assertEqual(worker.state_notes[-1][0], "failed")
             self.assertTrue(worker.state_notes[-1][1].startswith("timeout:"))
 
+    def test_run_turn_does_not_send_prompt_after_runtime_shutdown(self):
+        class ShutdownBeforeSubmitWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent = False
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def _ensure_agent_ready_for_turn_start(self, **kwargs):
+                self.pane_id = "%1"
+                self.agent_ready = True
+                request_runtime_shutdown("unit_test")
+
+            def _send_text(self, text, enter_count=None):
+                self.sent = True
+                raise AssertionError("prompt should not be sent after shutdown")
+
+        clear_runtime_shutdown_request()
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                worker = ShutdownBeforeSubmitWorker(
+                    worker_id="shutdown-worker",
+                    work_dir=tmp_dir,
+                    config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                    runtime_root=Path(tmp_dir) / "runtime",
+                )
+                with self.assertRaises(RuntimeShutdownRequested):
+                    worker.run_turn(label="shutdown_case", prompt="hello", required_tokens=["[[DONE]]"], timeout_sec=0.05)
+                self.assertFalse(worker.sent)
+        finally:
+            clear_runtime_shutdown_request()
+
     def test_run_turn_restores_running_state_after_agent_ready(self):
         class SubmitStateWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -2731,7 +2767,13 @@ workspace (/directory)                                                     branc
                 json.dumps([{"task_name": "M1-T1", "review_pass": True}], ensure_ascii=False),
                 encoding="utf-8",
             )
+            time.sleep(0.01)
             task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            review_md_path.write_text("", encoding="utf-8")
+            review_json_path.write_text(
+                json.dumps([{"task_name": "M1-T1", "review_pass": True}], ensure_ascii=False),
+                encoding="utf-8",
+            )
 
             def validator(path: Path) -> TurnFileResult:
                 payload = json.loads(path.read_text(encoding="utf-8"))
@@ -2778,6 +2820,89 @@ workspace (/directory)                                                     branc
             self.assertEqual(Path(result.status_path).resolve(), review_json_path.resolve())
             self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
             self.assertEqual(worker.current_task_runtime_status, "done")
+
+    def test_wait_for_turn_artifacts_rejects_stale_review_contract_when_agent_ready(self):
+        class ReadyReviewContractWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="› ready",
+                    raw_log_delta="",
+                    raw_log_tail="› ready",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-03T21:39:00",
+                )
+
+            def get_agent_state(self, observation=None):
+                return AgentRuntimeState.READY
+
+            def capture_visible(self, tail_lines=500):
+                return "› ready"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            review_md_path = root / "需求A_代码评审记录_测试工程师.md"
+            review_json_path = root / "需求A_评审记录_测试工程师.json"
+            task_status_path = root / "task_runtime.json"
+            review_md_path.write_text("", encoding="utf-8")
+            review_json_path.write_text(
+                json.dumps([{"task_name": "M1-T1", "review_pass": True}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            time.sleep(0.01)
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                matched = payload[0]
+                if matched["task_name"] != "M1-T1" or matched["review_pass"] is not True:
+                    raise ValueError("review payload mismatch")
+                if review_md_path.read_text(encoding="utf-8").strip():
+                    raise ValueError("review md must be empty on pass")
+                return TurnFileResult(
+                    status_path=str(path.resolve()),
+                    payload={"task_name": "M1-T1", "review_pass": True},
+                    artifact_paths={
+                        "review_md": str(review_md_path.resolve()),
+                        "review_json": str(review_json_path.resolve()),
+                    },
+                    artifact_hashes={
+                        "review_md": "sha256:empty",
+                        "review_json": "sha256:pass",
+                    },
+                    validated_at="2026-05-03T21:39:00",
+                )
+
+            worker = ReadyReviewContractWorker(
+                worker_id="stale-review-contract-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode/big-pickle"),
+                runtime_root=root / "runtime",
+            )
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+
+            with self.assertRaisesRegex(RuntimeError, "stale_review_round_artifacts"):
+                worker.wait_for_turn_artifacts(
+                    contract=TurnFileContract(
+                        turn_id="development_review_M1-T1_R2",
+                        phase="任务开发",
+                        status_path=review_json_path,
+                        validator=validator,
+                        quiet_window_sec=0.0,
+                        kind="review_round",
+                    ),
+                    task_status_path=task_status_path,
+                    timeout_sec=1.0,
+                )
+
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "running"})
 
     def test_wait_for_turn_artifacts_raises_contract_violation_after_done_with_invalid_files(self):
         class InvalidFileContractWorker(TmuxBatchWorker):
@@ -5842,6 +5967,63 @@ workspace (/directory)                                                     branc
             self.assertEqual(worker.wrapper_state, WrapperState.READY)
             self.assertEqual(worker.last_pane_title, "tmux-api-v3")
             self.assertEqual(worker.observe_count, 3)
+            state = worker.read_state()
+            self.assertEqual(state["agent_state"], AgentRuntimeState.READY.value)
+            self.assertEqual(state["agent_ready"], True)
+            self.assertEqual(state["pane_title"], "tmux-api-v3")
+
+    def test_ensure_agent_ready_syncs_codex_ready_title_to_state_file(self):
+        class FastReadyWorker(TmuxBatchWorker):
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):
+                return True
+
+            def _ensure_health_supervisor_started(self):
+                return None
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="› Continue with the task",
+                    raw_log_delta="",
+                    raw_log_tail="› Continue with the task",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-08T18:10:00",
+                    pane_title="DRL_PM",
+                )
+
+        with tempfile.TemporaryDirectory(prefix="codex-fast-ready-") as tmp_dir:
+            work_dir = Path(tmp_dir) / "DRL_PM"
+            work_dir.mkdir()
+            worker = FastReadyWorker(
+                worker_id="fast-ready-worker",
+                work_dir=work_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_ready = False
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.wrapper_state = WrapperState.NOT_READY
+
+            worker.ensure_agent_ready(timeout_sec=0.1)
+
+            state = worker.read_state()
+            self.assertTrue(worker.agent_ready)
+            self.assertEqual(worker.agent_state, AgentRuntimeState.READY)
+            self.assertEqual(worker.wrapper_state, WrapperState.READY)
+            self.assertEqual(worker.last_pane_title, "DRL_PM")
+            self.assertEqual(state["agent_state"], AgentRuntimeState.READY.value)
+            self.assertEqual(state["agent_ready"], True)
+            self.assertEqual(state["current_command"], "node")
+            self.assertEqual(state["current_path"], str(worker.work_dir))
+            self.assertEqual(state["pane_title"], "DRL_PM")
 
     def test_wait_for_agent_ready_rejects_codex_visible_prompt_with_busy_title(self):
         class VisibleReadyWorker(TmuxBatchWorker):
@@ -6860,6 +7042,91 @@ Do you trust the files in this folder?
             self.assertEqual(sorted(backend.killed), ["session-a", "session-b"])
             self.assertFalse(worker_a.recoverable)
             self.assertFalse(worker_b.recoverable)
+
+    def test_create_session_refuses_after_runtime_shutdown_requested(self):
+        class FakeBackend:
+            def __init__(self):
+                self.created: list[str] = []
+
+            def list_sessions(self):
+                return []
+
+            def has_session(self, session_name):
+                return False
+
+            def run(self, *args, **kwargs):
+                return SimpleNamespace(stdout="", returncode=0)
+
+            def create_session(self, session_name, work_dir, command):
+                self.created.append(session_name)
+                return "%1"
+
+            def kill_session(self, session_name):
+                raise AssertionError("no session should be created")
+
+        clear_runtime_shutdown_request()
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                backend = FakeBackend()
+                worker = TmuxBatchWorker(
+                    worker_id="shutdown-create-worker",
+                    work_dir=tmp_dir,
+                    config=AgentRunConfig(vendor="codex", model="gpt-5.4"),
+                    runtime_root=Path(tmp_dir) / "runtime",
+                    backend=backend,
+                )
+                request_runtime_shutdown("unit_test")
+                with self.assertRaises(RuntimeShutdownRequested):
+                    worker.create_session()
+                self.assertEqual(backend.created, [])
+        finally:
+            clear_runtime_shutdown_request()
+
+    def test_create_session_kills_session_created_during_runtime_shutdown(self):
+        class FakeBackend:
+            def __init__(self):
+                self.live_sessions: set[str] = set()
+                self.created: list[str] = []
+                self.killed: list[str] = []
+
+            def list_sessions(self):
+                return sorted(self.live_sessions)
+
+            def has_session(self, session_name):
+                return session_name in self.live_sessions
+
+            def run(self, *args, **kwargs):
+                return SimpleNamespace(stdout="", returncode=0)
+
+            def create_session(self, session_name, work_dir, command):
+                self.created.append(session_name)
+                self.live_sessions.add(session_name)
+                request_runtime_shutdown("unit_test")
+                return "%1"
+
+            def kill_session(self, session_name):
+                self.killed.append(session_name)
+                self.live_sessions.discard(session_name)
+
+        clear_runtime_shutdown_request()
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                backend = FakeBackend()
+                worker = TmuxBatchWorker(
+                    worker_id="shutdown-create-race-worker",
+                    work_dir=tmp_dir,
+                    config=AgentRunConfig(vendor="codex", model="gpt-5.4"),
+                    runtime_root=Path(tmp_dir) / "runtime",
+                    backend=backend,
+                )
+                with self.assertRaises(RuntimeShutdownRequested):
+                    worker.create_session()
+                self.assertEqual(backend.created, [worker.session_name])
+                self.assertEqual(backend.killed, [worker.session_name])
+                self.assertEqual(backend.live_sessions, set())
+                self.assertEqual(worker.pane_id, "")
+        finally:
+            clear_runtime_shutdown_request()
 
     def test_refresh_health_auto_relaunch_is_blocked(self):
         class RelaunchWorker(TmuxBatchWorker):

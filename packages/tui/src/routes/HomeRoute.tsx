@@ -36,6 +36,11 @@ function AgentStatusMarker(props: { agentState: string }) {
   return <text fg={color()}>{markerText()}</text>
 }
 
+function agentSummary(agent: HomeAgentItem): string {
+  const stateText = `${agent.healthStatus}/${agent.agentState}`
+  return [agent.sessionName, agent.agentConfigLabel, stateText].filter(Boolean).join(' | ')
+}
+
 export function HomeRoute(props: Props) {
   return (
     <box flexDirection="column" gap={1} paddingLeft={1} paddingRight={1} flexGrow={1}>
@@ -50,6 +55,9 @@ export function HomeRoute(props: Props) {
         <text fg={props.hitl.pending ? '#f7c948' : '#888888'}>{props.hitl.pending ? '存在待处理 HITL' : '当前没有待处理 HITL'}</text>
         <Show when={props.hitl.questionPath}>
           <text fg="#888888">question: {props.hitl.questionPath}</text>
+        </Show>
+        <Show when={props.hitl.attachCommand}>
+          <text fg="#f7c948">{props.hitl.attachCommand}</text>
         </Show>
         <Show when={props.hitl.pending}>
           <text fg="#888888">Ctrl+L 查看完整日志</text>
@@ -72,7 +80,7 @@ export function HomeRoute(props: Props) {
               <box flexDirection="column" marginTop={1}>
                 <box flexDirection="row" gap={1}>
                   <AgentStatusMarker agentState={agent.agentState} />
-                  <text>{`${agent.source} | ${agent.sessionName} | ${agent.healthStatus}/${agent.agentState}`}</text>
+                  <text>{agentSummary(agent)}</text>
                 </box>
                 <text fg="#888888">{agent.attachCommand}</text>
               </box>

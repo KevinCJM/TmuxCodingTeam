@@ -7,7 +7,13 @@ from tmux_core.runtime.tmux_runtime import (
     is_worker_death_error,
     worker_state_is_prelaunch_active,
 )
-from tmux_core.stage_kernel.role_orchestration import ensure_main_ready, ensure_reviewers_ready
+from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_RECHECK,
+    AGENT_INTERVENTION_RECREATE,
+    AGENT_INTERVENTION_WORKER_DEAD,
+    request_worker_manual_intervention,
+)
+from tmux_core.stage_kernel.role_orchestration import WorkerReadyCheckFailed, ensure_main_ready
 
 TMain = TypeVar("TMain")
 TReviewer = TypeVar("TReviewer")
@@ -161,6 +167,40 @@ def _main_ready_error_requires_replacement(
     return session_name in message
 
 
+def _ready_error_reason(error: Exception) -> str:
+    if isinstance(error, WorkerReadyCheckFailed):
+        return str(error.reason_text or "").strip() or str(error)
+    return str(error or "").strip()
+
+
+def _build_dead_ready_error(owner: object | None, *, role_label: str) -> WorkerReadyCheckFailed:
+    worker = _resolve_worker(owner)
+    return WorkerReadyCheckFailed(
+        role_label=role_label,
+        worker=worker,
+        state_name="DEAD",
+        reason_text=f"{role_label} 已死亡或已关闭，需要人工决定恢复方式。",
+    )
+
+
+def _request_ready_intervention(
+    *,
+    role_label: str,
+    worker: object | None,
+    error: Exception,
+    allow_recreate: bool,
+    allow_worker_dead: bool,
+) -> str:
+    return request_worker_manual_intervention(
+        stage_label="阶段调度",
+        role_label=role_label,
+        worker=worker,
+        reason_text=_ready_error_reason(error),
+        allow_recreate=allow_recreate,
+        allow_worker_dead=allow_worker_dead,
+    )
+
+
 def _ensure_main_ready_with_replacement(
     current_main: TMain,
     current_reviewers: Sequence[TReviewer],
@@ -173,27 +213,40 @@ def _ensure_main_ready_with_replacement(
 ) -> TMain:
     # Main-phase recovery only owns the main worker. Reviewers are filtered by
     # drop_dead_reviewers and then handled by reviewer-phase wrappers.
-    try:
-        ensure_main_ready(
-            current_main,
-            (),
-            main_label=main_label,
-            timeout_sec=timeout_sec,
-            allow_completed_nonready=allow_completed_nonready,
+    while True:
+        error: Exception | None = None
+        if _is_dead(current_main):
+            error = _build_dead_ready_error(current_main, role_label=main_label)
+        else:
+            try:
+                ensure_main_ready(
+                    current_main,
+                    (),
+                    main_label=main_label,
+                    timeout_sec=timeout_sec,
+                    allow_completed_nonready=allow_completed_nonready,
+                )
+                return current_main
+            except RuntimeError as caught:
+                if not isinstance(caught, WorkerReadyCheckFailed) and not _main_ready_error_requires_replacement(
+                    caught,
+                    current_main,
+                    reviewers=current_reviewers,
+                ):
+                    raise
+                error = caught
+        decision = _request_ready_intervention(
+            role_label=main_label,
+            worker=_resolve_worker(current_main),
+            error=error,
+            allow_recreate=True,
+            allow_worker_dead=False,
         )
-        return current_main
-    except RuntimeError as error:
-        if not _main_ready_error_requires_replacement(error, current_main, reviewers=current_reviewers):
-            raise
-    replacement = replace_dead_main_owner(current_main)
-    ensure_main_ready(
-        replacement,
-        (),
-        main_label=main_label,
-        timeout_sec=timeout_sec,
-        allow_completed_nonready=allow_completed_nonready,
-    )
-    return replacement
+        if decision == AGENT_INTERVENTION_RECREATE:
+            current_main = replace_dead_main_owner(current_main)
+            continue
+        if decision == AGENT_INTERVENTION_RECHECK:
+            continue
 
 
 def run_main_phase_with_death_handling(
@@ -209,7 +262,7 @@ def run_main_phase_with_death_handling(
     notify: Callable[[str], None] | None = None,
     timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
 ) -> tuple[TResult, list[TReviewer], TMain]:
-    current_main = replace_dead_main(main_owner, replace_owner=replace_dead_main_owner)
+    current_main = main_owner
     current_reviewers = drop_dead_reviewers(
         reviewers,
         replace_reviewer=replace_dead_reviewer,
@@ -226,7 +279,6 @@ def run_main_phase_with_death_handling(
     )
     result = run_phase(current_main)
     updated_main = owner_getter(result) if owner_getter is not None else result
-    updated_main = replace_dead_main(updated_main, replace_owner=replace_dead_main_owner)
     current_reviewers = drop_dead_reviewers(
         current_reviewers,
         replace_reviewer=replace_dead_reviewer,
@@ -257,7 +309,7 @@ def run_reviewer_phase_with_death_handling(
     notify: Callable[[str], None] | None = None,
     timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
 ) -> tuple[list[TReviewer], TMain]:
-    current_main = replace_dead_main(main_owner, replace_owner=replace_dead_main_owner)
+    current_main = main_owner
     current_reviewers = drop_dead_reviewers(
         reviewers,
         replace_reviewer=replace_dead_reviewer,
@@ -267,34 +319,75 @@ def run_reviewer_phase_with_death_handling(
     # Reviewer startup is intentionally lazy here: stage-specific reviewer turn
     # wrappers know how to recreate or drop a reviewer after provider/auth/ready
     # failures, while this shared layer only guarantees the main owner is ready.
-    ensure_main_ready(
+    current_main = _ensure_main_ready_with_replacement(
         current_main,
         (),
+        replace_dead_main_owner=replace_dead_main_owner,
         main_label=main_label,
+        reviewer_label_getter=reviewer_label_getter,
         timeout_sec=timeout_sec,
     )
     updated_reviewers = run_phase(current_reviewers)
-    current_main = replace_dead_main(current_main, replace_owner=replace_dead_main_owner)
     updated_reviewers = drop_dead_reviewers(
         updated_reviewers,
         replace_reviewer=replace_dead_reviewer,
         reviewer_label_getter=reviewer_label_getter,
         notify=notify,
     )
-    reviewers_for_ready_check = _filter_reviewers_for_final_ready_check(
-        updated_reviewers,
-        reviewer_label_getter=reviewer_label_getter,
-        notify=notify,
-    )
-    ensure_reviewers_ready(
+    current_main = _ensure_main_ready_with_replacement(
         current_main,
-        reviewers_for_ready_check,
+        updated_reviewers,
+        replace_dead_main_owner=replace_dead_main_owner,
         main_label=main_label,
         reviewer_label_getter=reviewer_label_getter,
         timeout_sec=timeout_sec,
         allow_completed_nonready=True,
     )
-    return updated_reviewers, current_main
+    ready_reviewers: list[TReviewer] = []
+    for index, reviewer in enumerate(updated_reviewers, start=1):
+        label = reviewer_label_getter(reviewer, index) if reviewer_label_getter is not None else f"审核智能体 {index}"
+        current_reviewer = reviewer
+        while True:
+            error: Exception | None = None
+            if _is_dead(current_reviewer):
+                error = _build_dead_ready_error(current_reviewer, role_label=label)
+            else:
+                try:
+                    ensure_main_ready(
+                        current_reviewer,
+                        (),
+                        main_label=label,
+                        timeout_sec=timeout_sec,
+                        allow_completed_nonready=True,
+                    )
+                    ready_reviewers.append(current_reviewer)
+                    break
+                except RuntimeError as caught:
+                    if not isinstance(caught, WorkerReadyCheckFailed):
+                        raise
+                    error = caught
+            decision = _request_ready_intervention(
+                role_label=label,
+                worker=_resolve_worker(current_reviewer),
+                error=error,
+                allow_recreate=replace_dead_reviewer is not None,
+                allow_worker_dead=True,
+            )
+            if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                if notify is not None:
+                    notify(f"{label} 已按死亡处理，后续将忽略该审核智能体。")
+                break
+            if decision == AGENT_INTERVENTION_RECREATE and replace_dead_reviewer is not None:
+                replacement = replace_dead_reviewer(current_reviewer, index)
+                if replacement is None:
+                    if notify is not None:
+                        notify(f"{label} 重新创建失败，后续将忽略该审核智能体。")
+                    break
+                current_reviewer = replacement
+                continue
+            if decision == AGENT_INTERVENTION_RECHECK:
+                continue
+    return ready_reviewers, current_main
 
 
 def ensure_active_reviewers(reviewers: Sequence[object], *, stage_label: str) -> None:

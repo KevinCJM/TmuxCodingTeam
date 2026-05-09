@@ -65,6 +65,14 @@ test('DialogPrompt delegates to PromptInputPanel instead of assembling its own h
   expect(content.includes('<PromptTextarea')).toBe(false)
 })
 
+test('DialogSelect renders optional hint lines above choices', () => {
+  const content = readFileSync(join(import.meta.dir, 'ui/DialogSelect.tsx'), 'utf8')
+  expect(content.includes('hintLines?: string[]')).toBe(true)
+  expect(content.includes('<For each={props.hintLines ?? []}>')).toBe(true)
+  expect(content.includes('fg="#f7c948"')).toBe(true)
+  expect(content.includes('wrapMode="none"')).toBe(true)
+})
+
 test('TUI startup enables mouse capture, alternate-screen mode, and disables noisy console overlay', () => {
   const content = readFileSync(join(import.meta.dir, 'index.tsx'), 'utf8')
   expect(content.includes('useMouse: true')).toBe(true)

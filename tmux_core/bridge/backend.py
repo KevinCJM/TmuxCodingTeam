@@ -30,10 +30,13 @@ from tmux_core.requirements_scope import resolve_requirement_name_from_prompt_re
 from tmux_core.runtime.tmux_runtime import (
     TmuxBatchWorker,
     TmuxRuntimeController,
+    clear_runtime_shutdown_request,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
+    is_runtime_shutdown_error,
     is_worker_death_error,
     load_worker_from_state_path,
+    request_runtime_shutdown,
     worker_state_is_prelaunch_active,
 )
 from tmux_core.stage_kernel.detailed_design import (
@@ -374,6 +377,20 @@ def _prompt_is_hitl(payload: Mapping[str, Any] | None) -> bool:
         ]
     ).strip()
     return "hitl" in marker.lower()
+
+
+def _prompt_attach_command(payload: Mapping[str, Any] | None) -> str:
+    if not isinstance(payload, Mapping):
+        return ""
+    raw_attach = payload.get("attach_command", payload.get("attachCommand", ""))
+    if isinstance(raw_attach, Sequence) and not isinstance(raw_attach, (str, bytes, bytearray)):
+        attach = " ".join(str(item) for item in raw_attach).strip()
+    else:
+        attach = str(raw_attach or "").strip()
+    if attach:
+        return attach
+    session_name = str(payload.get("session_name", payload.get("sessionName", "")) or "").strip()
+    return f"tmux attach -t {session_name}" if session_name else ""
 
 
 def _prompt_requires_attention(prompt_type: str, payload: Mapping[str, Any] | None) -> bool:
@@ -1244,6 +1261,9 @@ def _read_worker_state_snapshot(
     ):
         status = raw_status
         current_task_runtime_status = ""
+    config_payload = state.get("config", {})
+    if not isinstance(config_payload, Mapping):
+        config_payload = {}
     return {
         "worker_id": str(state.get("worker_id") or state.get("raw_worker_id") or "").strip(),
         "session_name": session_name,
@@ -1271,6 +1291,10 @@ def _read_worker_state_snapshot(
         "workflow_action": str(state.get("workflow_action", "")).strip(),
         "stage_seq": str(state.get("stage_seq", "")).strip(),
         "run_id": str(state.get("run_id", "")).strip(),
+        "vendor": str(config_payload.get("vendor", "")).strip(),
+        "model": str(config_payload.get("model", "")).strip(),
+        "resolved_model": str(config_payload.get("resolved_model", "")).strip(),
+        "reasoning_effort": str(config_payload.get("reasoning_effort", "")).strip(),
     }
 
 
@@ -1306,6 +1330,7 @@ class BridgeCore:
         self._controls_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
+        self._shutdown_tmux_cleanup_done = False
         self._context = AppContext()
         self._presence_ttl_sec = 15.0
         self._tui_presence = TuiPresenceState()
@@ -2554,8 +2579,9 @@ class BridgeCore:
                 "question_path": str(pending.payload.get("question_path", "") or "").strip(),
                 "answer_path": str(pending.payload.get("answer_path", "") or "").strip(),
                 "summary": summary,
+                "attach_command": _prompt_attach_command(pending.payload),
             }
-        return {"pending": False, "question_path": "", "answer_path": "", "summary": ""}
+        return {"pending": False, "question_path": "", "answer_path": "", "summary": "", "attach_command": ""}
 
     def _build_hitl_snapshot(self) -> dict[str, Any]:
         prompt_snapshot = self._build_pending_prompt_hitl_snapshot()
@@ -2925,8 +2951,9 @@ class BridgeCore:
                 "question_path": question_path,
                 "answer_path": answer_path,
                 "summary": question_summary,
+                "attach_command": _prompt_attach_command(worker),
             }
-        return {"pending": False, "question_path": "", "answer_path": "", "summary": ""}
+        return {"pending": False, "question_path": "", "answer_path": "", "summary": "", "attach_command": ""}
 
     @staticmethod
     def _review_json_has_task_result(path_value: str | Path, *, task_name: str) -> bool:
@@ -3837,6 +3864,8 @@ class BridgeCore:
                     fallback_action=action,
                     fallback_stage_seq=stage_seq,
                 )
+                if is_runtime_shutdown_error(error):
+                    return
                 if is_agent_ready_timeout_error(error):
                     self._await_agent_ready_timeout_recovery(
                         request_id=request_id,
@@ -4035,30 +4064,52 @@ class BridgeCore:
                     cleaned_sessions.append(cleaned_session)
         return sorted(set(cleaned_sessions))
 
-    def shutdown(self, *, cleanup_tmux: bool) -> list[str]:
-        with self._shutdown_lock:
-            if self._shutdown_started:
-                return []
-            self._shutdown_started = True
-        with self._snapshot_dirty_lock:
-            timer = self._snapshot_debounce_timer
-            self._snapshot_debounce_timer = None
-            self._snapshot_dirty_sections.clear()
-            self._snapshot_dirty_stage_routes.clear()
-        if timer is not None:
-            timer.cancel()
-        self._prompt_broker.shutdown()
-        self._attention_manager.shutdown()
-        with self._controls_lock:
-            sessions = list(self._controls.values())
-            self._controls.clear()
-        for session in sessions:
+    def _join_active_runner_threads(self, *, timeout_sec: float) -> None:
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        current_thread = threading.current_thread()
+        with self._worker_registry_lock:
+            threads = [thread for thread in self._workers.values() if thread is not current_thread]
+        for thread in threads:
             try:
-                session.center.close()
+                if not thread.is_alive():
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                thread.join(timeout=min(remaining, 0.5))
             except Exception:
                 continue
+
+    def shutdown(self, *, cleanup_tmux: bool) -> list[str]:
+        request_runtime_shutdown("tui_backend_shutdown")
+        first_shutdown = False
+        with self._shutdown_lock:
+            if not self._shutdown_started:
+                self._shutdown_started = True
+                first_shutdown = True
+            elif not cleanup_tmux or self._shutdown_tmux_cleanup_done:
+                return []
+        if first_shutdown:
+            with self._snapshot_dirty_lock:
+                timer = self._snapshot_debounce_timer
+                self._snapshot_debounce_timer = None
+                self._snapshot_dirty_sections.clear()
+                self._snapshot_dirty_stage_routes.clear()
+            if timer is not None:
+                timer.cancel()
+            self._prompt_broker.shutdown()
+            self._attention_manager.shutdown()
+            with self._controls_lock:
+                sessions = list(self._controls.values())
+                self._controls.clear()
+            for session in sessions:
+                try:
+                    session.center.close()
+                except Exception:
+                    continue
         cleaned_sessions: list[str] = []
         if cleanup_tmux:
+            self._join_active_runner_threads(timeout_sec=3.0)
             cleaned_sessions = sorted(
                 set(
                     cleanup_registered_tmux_workers(reason="tui_backend_shutdown")
@@ -4071,6 +4122,8 @@ class BridgeCore:
                     "log.append",
                     {"text": f"已清理 tmux 会话: {', '.join(cleaned_sessions)}\n"},
                 )
+            with self._shutdown_lock:
+                self._shutdown_tmux_cleanup_done = True
         self._protocol_log_sink.flush()
         return cleaned_sessions
 
@@ -4579,6 +4632,7 @@ class BridgeCore:
 
 class TuiBackendServer(BridgeCore):
     def __init__(self, *, reader: TextIO | None = None, writer: TextIO | None = None) -> None:
+        clear_runtime_shutdown_request()
         super().__init__()
         self.reader = reader or sys.stdin
         self.writer = writer or sys.stdout

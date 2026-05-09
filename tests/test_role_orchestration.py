@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from tmux_core.stage_kernel.death_orchestration import (
     drop_dead_reviewers,
@@ -9,7 +10,17 @@ from tmux_core.stage_kernel.death_orchestration import (
     run_main_phase_with_death_handling,
     run_reviewer_phase_with_death_handling,
 )
-from tmux_core.stage_kernel.role_orchestration import ensure_main_ready, run_main_phase, run_reviewer_phase
+from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_RECHECK,
+    AGENT_INTERVENTION_RECREATE,
+    AGENT_INTERVENTION_WORKER_DEAD,
+)
+from tmux_core.stage_kernel.role_orchestration import (
+    WorkerReadyCheckFailed,
+    ensure_main_ready,
+    run_main_phase,
+    run_reviewer_phase,
+)
 
 
 class _FakeWorker:
@@ -36,6 +47,26 @@ class _HealthAwareWorker(_FakeWorker):
 
     def observe(self, tail_lines: int = 120):  # noqa: ARG002
         return SimpleNamespace()
+
+
+class _LaggingRefreshWorker(_FakeWorker):
+    def __init__(self, states: list[str]) -> None:
+        super().__init__(states[0])
+        self.states = list(states)
+        self.refresh_calls = 0
+
+    def refresh_health(self, notify_on_change: bool = True):  # noqa: ARG002
+        self.refresh_calls += 1
+        if self.states:
+            self.state = self.states.pop(0)
+        return SimpleNamespace(agent_state=self.state)
+
+    def read_state(self):
+        return {"health_status": "alive", "agent_state": self.state}
+
+    def ensure_agent_ready(self, timeout_sec: float = 0.0) -> None:
+        _ = timeout_sec
+        self.ensure_calls += 1
 
 
 class _CompletedBusyWorker(_FakeWorker):
@@ -210,6 +241,44 @@ class RoleOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(worker.ensure_calls, 1)
 
+    def test_ensure_main_ready_waits_for_ready_stabilization_after_ensure(self):
+        worker = _LaggingRefreshWorker(["BUSY", "BUSY", "READY"])
+        main = SimpleNamespace(worker=worker)
+
+        with mock.patch("tmux_core.stage_kernel.role_orchestration.time.sleep", return_value=None):
+            ensure_main_ready(main)
+
+        self.assertEqual(worker.ensure_calls, 1)
+        self.assertEqual(worker.state, "READY")
+        self.assertEqual(worker.refresh_calls, 3)
+
+    def test_ensure_main_ready_allows_startup_busy_past_short_grace(self):
+        worker = _LaggingRefreshWorker(["BUSY", "BUSY", "BUSY", "BUSY", "READY"])
+        main = SimpleNamespace(worker=worker)
+
+        with mock.patch(
+            "tmux_core.stage_kernel.role_orchestration.time.monotonic",
+            side_effect=[0.0, 0.0, 11.0],
+        ), mock.patch("tmux_core.stage_kernel.role_orchestration.time.sleep", return_value=None):
+            ensure_main_ready(main)
+
+        self.assertEqual(worker.ensure_calls, 1)
+        self.assertEqual(worker.state, "READY")
+
+    def test_ensure_main_ready_fails_after_ready_stabilization_grace_expires(self):
+        worker = _LaggingRefreshWorker(["BUSY", "BUSY", "BUSY"])
+        main = SimpleNamespace(worker=worker)
+
+        with mock.patch(
+            "tmux_core.stage_kernel.role_orchestration.time.monotonic",
+            side_effect=[0.0, 0.0, 61.0],
+        ), mock.patch("tmux_core.stage_kernel.role_orchestration.time.sleep", return_value=None):
+            with self.assertRaisesRegex(WorkerReadyCheckFailed, "开发工程师 未进入 READY 状态"):
+                ensure_main_ready(main, main_label="开发工程师")
+
+        self.assertEqual(worker.ensure_calls, 1)
+        self.assertEqual(worker.state, "BUSY")
+
     def test_run_reviewer_phase_waits_before_and_after_reviewer_round(self):
         main = SimpleNamespace(worker=_FakeWorker("READY"))
         reviewers = [
@@ -296,19 +365,49 @@ class RoleOrchestrationTests(unittest.TestCase):
             replace_calls.append(owner)
             return replacement
 
-        result, reviewers, current_main = run_main_phase_with_death_handling(
-            main,
-            reviewers=(),
-            run_phase=lambda owner: owner,
-            replace_dead_main_owner=_replace,
-            main_label="开发工程师",
-        )
+        with mock.patch(
+            "tmux_core.stage_kernel.death_orchestration.request_worker_manual_intervention",
+            return_value=AGENT_INTERVENTION_RECREATE,
+        ) as prompt:
+            result, reviewers, current_main = run_main_phase_with_death_handling(
+                main,
+                reviewers=(),
+                run_phase=lambda owner: owner,
+                replace_dead_main_owner=_replace,
+                main_label="开发工程师",
+            )
 
         self.assertIs(result, replacement)
         self.assertEqual(reviewers, [])
         self.assertIs(current_main, replacement)
         self.assertEqual(replace_calls, [main])
         self.assertEqual(main.worker.ensure_calls, 1)
+        prompt.assert_called_once()
+
+    def test_run_main_phase_with_death_handling_rechecks_ready_failure(self):
+        main = SimpleNamespace(worker=_LaggingRefreshWorker(["BUSY", "BUSY", "BUSY", "BUSY", "READY"]))
+        replace_calls: list[object] = []
+
+        with mock.patch(
+            "tmux_core.stage_kernel.role_orchestration.time.monotonic",
+            side_effect=[0.0, 0.0, 61.0],
+        ), mock.patch("tmux_core.stage_kernel.role_orchestration.time.sleep", return_value=None), mock.patch(
+            "tmux_core.stage_kernel.death_orchestration.request_worker_manual_intervention",
+            return_value=AGENT_INTERVENTION_RECHECK,
+        ) as prompt:
+            result, reviewers, current_main = run_main_phase_with_death_handling(
+                main,
+                reviewers=(),
+                run_phase=lambda owner: owner,
+                replace_dead_main_owner=lambda owner: replace_calls.append(owner) or owner,
+                main_label="开发工程师",
+            )
+
+        self.assertIs(result, main)
+        self.assertEqual(reviewers, [])
+        self.assertIs(current_main, main)
+        self.assertEqual(replace_calls, [])
+        prompt.assert_called_once()
 
     def test_run_main_phase_with_death_handling_ignores_reviewer_ready_death(self):
         main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
@@ -382,6 +481,56 @@ class RoleOrchestrationTests(unittest.TestCase):
 
         self.assertIs(current_main, main)
         self.assertEqual(updated, [reviewer])
+
+    def test_run_reviewer_phase_with_death_handling_drops_reviewer_after_manual_dead_choice(self):
+        main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
+        reviewer = SimpleNamespace(worker=_LaggingRefreshWorker(["BUSY", "BUSY", "BUSY"]), reviewer_name="测试工程师")
+        notices: list[str] = []
+
+        with mock.patch(
+            "tmux_core.stage_kernel.role_orchestration.time.monotonic",
+            side_effect=[0.0, 0.0, 61.0],
+        ), mock.patch("tmux_core.stage_kernel.role_orchestration.time.sleep", return_value=None), mock.patch(
+            "tmux_core.stage_kernel.death_orchestration.request_worker_manual_intervention",
+            return_value=AGENT_INTERVENTION_WORKER_DEAD,
+        ) as prompt:
+            updated, current_main = run_reviewer_phase_with_death_handling(
+                main,
+                [reviewer],
+                run_phase=lambda reviewers: list(reviewers),
+                replace_dead_main_owner=lambda owner: owner,
+                reviewer_label_getter=lambda item, _index: item.reviewer_name,
+                notify=notices.append,
+            )
+
+        self.assertIs(current_main, main)
+        self.assertEqual(updated, [])
+        self.assertEqual(notices, ["测试工程师 已按死亡处理，后续将忽略该审核智能体。"])
+        prompt.assert_called_once()
+
+    def test_run_reviewer_phase_with_death_handling_recreates_reviewer_after_manual_choice(self):
+        main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
+        reviewer = SimpleNamespace(worker=_ReadyDeathWorker(session_name="审核员-地巧星"), reviewer_name="审核员-地巧星")
+        replacement = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True), reviewer_name="审核员-新")
+        replace_calls: list[object] = []
+
+        with mock.patch(
+            "tmux_core.stage_kernel.death_orchestration.request_worker_manual_intervention",
+            return_value=AGENT_INTERVENTION_RECREATE,
+        ) as prompt:
+            updated, current_main = run_reviewer_phase_with_death_handling(
+                main,
+                [reviewer],
+                run_phase=lambda reviewers: list(reviewers),
+                replace_dead_main_owner=lambda owner: owner,
+                replace_dead_reviewer=lambda item, _index: replace_calls.append(item) or replacement,
+                reviewer_label_getter=lambda item, _index: item.reviewer_name,
+            )
+
+        self.assertIs(current_main, main)
+        self.assertEqual(updated, [replacement])
+        self.assertEqual(replace_calls, [reviewer])
+        prompt.assert_called_once()
 
 
 if __name__ == "__main__":

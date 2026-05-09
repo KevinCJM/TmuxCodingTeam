@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import A01_Routing_LayerPlanning as routing_stage
 from tmux_core.stage_kernel import detailed_design, requirements_review, reviewer_orchestration, shared_review
+from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 from T09_terminal_ops import PromptBackRequested
 
 
@@ -63,6 +64,64 @@ class StageKernelSharedTests(unittest.TestCase):
         reviewer = SimpleNamespace(worker=_PrelaunchReviewer(), reviewer_name="审核员")
 
         self.assertFalse(reviewer_orchestration._owner_is_dead(reviewer))  # noqa: SLF001
+
+    def test_reviewer_repair_hitl_can_recreate_reviewer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            old_reviewer = SimpleNamespace(
+                reviewer_name="测试工程师",
+                worker=SimpleNamespace(session_name="测试工程师-天暴星"),
+                review_md_path=root / "old.md",
+                review_json_path=root / "old.json",
+            )
+            new_reviewer = SimpleNamespace(
+                reviewer_name="测试工程师",
+                worker=SimpleNamespace(session_name="测试工程师-天勇星"),
+                review_md_path=root / "new.md",
+                review_json_path=root / "new.json",
+            )
+            fixed = {"done": False}
+            check_names: list[tuple[str, ...]] = []
+            recreated: list[object] = []
+            fix_calls: list[tuple[object, str, int]] = []
+
+            def check_job(names):
+                check_names.append(tuple(names))
+                if fixed["done"]:
+                    return {}
+                return {names[0]: "请修复审核输出"} if names else {}
+
+            def recreate(reviewer):
+                recreated.append(reviewer)
+                return new_reviewer
+
+            def run_fix_turn(reviewer, prompt, repair_attempt):
+                fix_calls.append((reviewer, prompt, repair_attempt))
+                fixed["done"] = True
+                return reviewer
+
+            with patch.object(
+                reviewer_orchestration,
+                "request_file_noncompliance_intervention",
+                return_value=AGENT_INTERVENTION_RECREATE,
+            ) as intervention:
+                result = reviewer_orchestration.repair_reviewer_round_outputs(
+                    [old_reviewer],
+                    key_func=lambda reviewer: reviewer.reviewer_name,
+                    artifact_name_func=lambda reviewer: str(reviewer.worker.session_name),
+                    check_job=check_job,
+                    run_fix_turn=run_fix_turn,
+                    max_attempts=0,
+                    error_prefix="审核修复失败",
+                    final_error="仍未按协议更新文档",
+                    recreate_reviewer=recreate,
+                )
+
+        self.assertEqual(result, [new_reviewer])
+        self.assertEqual(recreated, [old_reviewer])
+        self.assertEqual(fix_calls, [(new_reviewer, "请修复审核输出", 1)])
+        self.assertTrue(intervention.call_args.kwargs["allow_recreate"])
+        self.assertIn(("测试工程师-天勇星",), check_names)
 
     def test_parse_review_max_rounds_supports_default_and_infinite(self):
         self.assertEqual(shared_review.parse_review_max_rounds("", source="--review-max-rounds"), 5)

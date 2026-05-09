@@ -104,6 +104,13 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
 const startup = parseStartupArgs(Bun.argv.slice(2))
 
 await render(
-  () => <App initialRoute={startup.route} initialAction={startup.action} initialArgv={startup.initialArgv} />,
+  () => (
+    <App
+      initialRoute={startup.route}
+      initialAction={startup.action}
+      initialArgv={startup.initialArgv}
+      onExitRequest={() => shutdownFromSignal('SIGINT')}
+    />
+  ),
   renderer,
 )

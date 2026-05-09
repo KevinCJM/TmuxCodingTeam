@@ -116,6 +116,7 @@ TURN_ARTIFACT_CONTRACT_ERROR_PREFIX = "turn artifacts contract violation after t
 TASK_RESULT_CONTRACT_ERROR_PREFIX = "task result contract violation after task completion"
 TIMEOUT_EXIT_CODE = -1
 GENERIC_ERROR_EXIT_CODE = 1
+RUNTIME_SHUTDOWN_ERROR_MARKER = "tmux runtime shutdown requested"
 PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -1108,6 +1109,53 @@ def is_agent_ready_timeout_error(error: BaseException | str) -> bool:
     if not message:
         return False
     return any(marker in message for marker in AGENT_READY_TIMEOUT_ERROR_MARKERS)
+
+
+class RuntimeShutdownRequested(RuntimeError):
+    """Raised inside worker code when the owning backend is shutting down."""
+
+
+_RUNTIME_SHUTDOWN_REQUESTED = threading.Event()
+_RUNTIME_SHUTDOWN_REASON_LOCK = threading.Lock()
+_RUNTIME_SHUTDOWN_REASON = ""
+
+
+def request_runtime_shutdown(reason: str = "") -> None:
+    global _RUNTIME_SHUTDOWN_REASON
+    reason_text = str(reason or "").strip() or "shutdown"
+    with _RUNTIME_SHUTDOWN_REASON_LOCK:
+        _RUNTIME_SHUTDOWN_REASON = reason_text
+    _RUNTIME_SHUTDOWN_REQUESTED.set()
+
+
+def clear_runtime_shutdown_request() -> None:
+    global _RUNTIME_SHUTDOWN_REASON
+    _RUNTIME_SHUTDOWN_REQUESTED.clear()
+    with _RUNTIME_SHUTDOWN_REASON_LOCK:
+        _RUNTIME_SHUTDOWN_REASON = ""
+
+
+def runtime_shutdown_requested() -> bool:
+    return _RUNTIME_SHUTDOWN_REQUESTED.is_set()
+
+
+def raise_if_runtime_shutdown_requested(context: str = "") -> None:
+    if not runtime_shutdown_requested():
+        return
+    with _RUNTIME_SHUTDOWN_REASON_LOCK:
+        reason_text = _RUNTIME_SHUTDOWN_REASON
+    context_text = str(context or "").strip()
+    details = f"{RUNTIME_SHUTDOWN_ERROR_MARKER}: {reason_text or 'shutdown'}"
+    if context_text:
+        details = f"{details} while {context_text}"
+    raise RuntimeShutdownRequested(details)
+
+
+def is_runtime_shutdown_error(error: BaseException | str) -> bool:
+    if isinstance(error, RuntimeShutdownRequested):
+        return True
+    message = str(error or "").strip().lower()
+    return RUNTIME_SHUTDOWN_ERROR_MARKER in message
 
 
 def is_turn_artifact_contract_error(error: BaseException | str) -> bool:
@@ -2557,6 +2605,23 @@ class TmuxBatchWorker:
         _release_reserved_session_name(self.session_name)
         self._session_name_reserved = False
 
+    def _abort_session_create_if_runtime_shutdown_requested(self, context: str) -> None:
+        try:
+            raise_if_runtime_shutdown_requested(context)
+        except RuntimeShutdownRequested:
+            with contextlib.suppress(Exception):
+                self._stop_health_supervisor()
+            if self.session_name:
+                with contextlib.suppress(Exception):
+                    self.backend.kill_session(self.session_name)
+            self.pane_id = ""
+            self.agent_ready = False
+            self.agent_started = False
+            self.wrapper_state = WrapperState.NOT_READY
+            self.agent_state = AgentRuntimeState.DEAD
+            self._release_session_name_reservation()
+            raise
+
     def mark_awaiting_reconfiguration(self, *, reason_text: str) -> None:
         self.agent_ready = False
         self.agent_state = AgentRuntimeState.STARTING
@@ -2630,6 +2695,7 @@ class TmuxBatchWorker:
         raise RuntimeError(message) from error
 
     def create_session(self) -> str:
+        raise_if_runtime_shutdown_requested("creating tmux session")
         self._reset_terminal_activity()
         self.agent_started = False
         self.agent_ready = False
@@ -2642,6 +2708,7 @@ class TmuxBatchWorker:
         retry_count = 0
         max_retries = SESSION_NAME_CREATE_MAX_RETRIES
         while True:
+            raise_if_runtime_shutdown_requested("creating tmux session")
             if self.session_exists():
                 if retry_count >= max_retries:
                     self._release_session_name_reservation()
@@ -2665,6 +2732,7 @@ class TmuxBatchWorker:
                     self.work_dir,
                     self._build_shell_bootstrap_command(),
                 )
+                self._abort_session_create_if_runtime_shutdown_requested("creating tmux session")
                 break
             except Exception as error:
                 if not self._is_session_name_conflict_error(error):
@@ -2687,6 +2755,7 @@ class TmuxBatchWorker:
         self._tmux("set-option", "-t", self.session_name, "allow-rename", "off")
         self._tmux("set-window-option", "-t", f"{self.session_name}:0", "automatic-rename", "off")
         self._set_tmux_identity_options()
+        self._abort_session_create_if_runtime_shutdown_requested("creating tmux session")
         self._start_pipe_logging()
         self._ensure_health_supervisor_started()
         self._refresh_health_state_nonintrusive()
@@ -2993,8 +3062,10 @@ class TmuxBatchWorker:
         self._log_event("send_key", key=key)
 
     def _send_text(self, text: str, enter_count: int | None = None) -> None:
+        raise_if_runtime_shutdown_requested("sending prompt to tmux worker")
         submit_count = enter_count if enter_count is not None else self.config.submit_enter_count()
         with self.send_lock:
+            raise_if_runtime_shutdown_requested("sending prompt to tmux worker")
             self.backend.send_text(self.pane_id, text, submit_count=submit_count)
         self._log_event("send_text", submit_count=submit_count, size=len(text))
 
@@ -3065,6 +3136,7 @@ class TmuxBatchWorker:
         initial_state = self.agent_state
 
         while time.monotonic() < deadline:
+            raise_if_runtime_shutdown_requested("waiting for prompt submission")
             observation = self.observe(tail_lines=320)
             if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while waiting for prompt submission")
@@ -3130,6 +3202,7 @@ class TmuxBatchWorker:
         last_probe_monotonic = 0.0
 
         while time.monotonic() < deadline:
+            raise_if_runtime_shutdown_requested("waiting for turn artifacts")
             previous_done_seen = status_done_seen
             status_done_seen = self._track_task_completion_signal(
                 task_status_path=task_status_path,
@@ -3221,6 +3294,16 @@ class TmuxBatchWorker:
                 stable_elapsed = 0.0
 
             if stable_elapsed >= max(float(contract.quiet_window_sec), 0.0):
+                fresh_for_task = self._turn_artifacts_are_fresh_for_task(
+                    contract,
+                    task_status_path=task_status_path,
+                )
+                if status_done_seen and not fresh_for_task:
+                    raise RuntimeError(
+                        f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}: "
+                        f"phase={contract.phase} status_path={contract.status_path} "
+                        f"stale_review_round_artifacts task_status_path={task_status_path}"
+                    )
                 if status_done_seen:
                     self._log_event(
                         "turn_artifacts_ready",
@@ -3241,6 +3324,15 @@ class TmuxBatchWorker:
                         f"agent exited back to shell while waiting for turn artifacts:\n{self._diagnostic_visible_tail(160)}"
                     )
                 agent_state = self.get_agent_state(observation)
+                if not fresh_for_task:
+                    if agent_state == AgentRuntimeState.READY:
+                        raise RuntimeError(
+                            f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}: "
+                            f"phase={contract.phase} status_path={contract.status_path} "
+                            f"stale_review_round_artifacts task_status_path={task_status_path}"
+                        )
+                    time.sleep(FILE_CONTRACT_POLL_INTERVAL_SEC)
+                    continue
                 if agent_state == AgentRuntimeState.READY:
                     if task_status_path is not None:
                         write_task_status(task_status_path, status=TASK_STATUS_DONE)
@@ -3351,6 +3443,8 @@ class TmuxBatchWorker:
         )
         if next_signature != signature:
             return None
+        if not self._turn_artifacts_are_fresh_for_task(contract, task_status_path=task_status_path):
+            return None
         if task_status_path is not None:
             write_task_status(task_status_path, status=TASK_STATUS_DONE)
         self.current_task_runtime_status = TASK_STATUS_DONE
@@ -3458,6 +3552,7 @@ class TmuxBatchWorker:
         if not prompt_submission_observed:
             return None
         while True:
+            raise_if_runtime_shutdown_requested("waiting for busy agent turn artifacts")
             observation = self._busy_agent_observation_after_turn_timeout()
             if observation is None:
                 return None
@@ -3499,6 +3594,7 @@ class TmuxBatchWorker:
         if not prompt_submission_observed:
             return None
         while True:
+            raise_if_runtime_shutdown_requested("waiting for busy agent task result")
             observation = self._busy_agent_observation_after_turn_timeout()
             if observation is None:
                 return None
@@ -3659,6 +3755,7 @@ class TmuxBatchWorker:
         status_done_seen = task_status_path is None
 
         while time.monotonic() < deadline:
+            raise_if_runtime_shutdown_requested("waiting for ready task result")
             status_done_seen = self._track_task_completion_signal(
                 task_status_path=task_status_path,
                 status_done_seen=status_done_seen,
@@ -3768,6 +3865,7 @@ class TmuxBatchWorker:
         last_probe_monotonic = 0.0
 
         while time.monotonic() < deadline:
+            raise_if_runtime_shutdown_requested("waiting for task result")
             previous_done_seen = status_done_seen
             status_done_seen = self._track_task_completion_signal(
                 task_status_path=task_status_path,
@@ -4061,6 +4159,7 @@ class TmuxBatchWorker:
         previous_output = ""
         stable_count = 0
         while time.monotonic() < deadline:
+            raise_if_runtime_shutdown_requested("waiting for prompt output stability")
             observation = self.observe(tail_lines=120)
             if not observation.session_exists:
                 raise RuntimeError("tmux pane exited before shell became ready")
@@ -4180,6 +4279,23 @@ class TmuxBatchWorker:
     def _stable_turn_artifacts_can_finish_task(contract: TurnFileContract) -> bool:
         contract_kind = str(contract.kind or "").strip()
         return contract_kind in {"routing_file_contract", "review_round"}
+
+    @staticmethod
+    def _turn_artifacts_are_fresh_for_task(
+            contract: TurnFileContract,
+            *,
+            task_status_path: Path | None,
+    ) -> bool:
+        if str(contract.kind or "").strip() != "review_round" or task_status_path is None:
+            return True
+        try:
+            task_started_mtime_ns = Path(task_status_path).expanduser().resolve().stat().st_mtime_ns
+        except OSError:
+            return True
+        try:
+            return contract.status_path.expanduser().resolve().stat().st_mtime_ns >= task_started_mtime_ns
+        except OSError:
+            return False
 
     def _probe_agent_liveness_for_file_wait(self) -> WorkerObservation:
         if type(self).observe is not TmuxBatchWorker.observe:
@@ -4563,11 +4679,52 @@ class TmuxBatchWorker:
             return WrapperState.READY
         return WrapperState.NOT_READY
 
+    def _mark_agent_ready_from_observation(
+            self,
+            observation: WorkerObservation,
+            *,
+            note: str = "agent_ready",
+    ) -> None:
+        current_command = observation.current_command or self.current_command
+        self.agent_ready = True
+        self.agent_started = True
+        self.agent_state = AgentRuntimeState.READY
+        self.wrapper_state = WrapperState.READY
+        self.last_pane_title = observation.pane_title or self.last_pane_title
+        self.current_command = current_command
+        self.current_path = observation.current_path or self.current_path
+        self.last_heartbeat_at = observation.observed_at or self.last_heartbeat_at
+        previous = self.read_state()
+        extra: dict[str, object] = {
+            "agent_alive": self.is_agent_alive(observation),
+            "agent_ready": True,
+            "agent_state": AgentRuntimeState.READY.value,
+            "current_command": current_command,
+            "current_path": observation.current_path or self.current_path,
+            "pane_title": self.last_pane_title,
+            "last_heartbeat_at": self.last_heartbeat_at,
+        }
+        result_status = str(previous.get("result_status", "pending") or "").strip().lower()
+        if result_status in {"", "running", "pending"}:
+            extra["result_status"] = WorkerStatus.READY.value
+        current_task_runtime_status = self.current_task_runtime_status or str(
+            previous.get("current_task_runtime_status", "")
+        )
+        if current_task_runtime_status == TASK_STATUS_RUNNING:
+            self.current_task_runtime_status = ""
+            extra["current_task_runtime_status"] = ""
+        self._write_state(
+            WorkerStatus.READY,
+            note=note,
+            extra=extra,
+        )
+
     def _wait_for_agent_ready(self, timeout_sec: float = 60.0) -> None:
         deadline = time.monotonic() + timeout_sec
         previous_ready_signature = ""
         stable_count = 0
         while time.monotonic() < deadline:
+            raise_if_runtime_shutdown_requested("waiting for agent ready")
             observation = self.observe(tail_lines=220)
             if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while agent was starting")
@@ -4597,19 +4754,7 @@ class TmuxBatchWorker:
                 else:
                     stable_count = 1 if ready_signature else 0
                 if stable_count >= 2 and ready_signature:
-                    self.agent_ready = True
-                    self.agent_started = True
-                    self.agent_state = AgentRuntimeState.READY
-                    self.wrapper_state = WrapperState.READY
-                    self.last_pane_title = observation.pane_title or self.last_pane_title
-                    self.current_command = current_command
-                    self.current_path = observation.current_path
-                    self.last_heartbeat_at = observation.observed_at
-                    self._write_state(
-                        WorkerStatus.READY,
-                        note="agent_ready",
-                        extra={"current_command": current_command, "current_path": observation.current_path},
-                    )
+                    self._mark_agent_ready_from_observation(observation)
                     return
             elif current_command in SHELL_COMMANDS and previous_ready_signature:
                 raise RuntimeError(f"agent exited back to shell while starting:\n{visible}")
@@ -4692,7 +4837,7 @@ class TmuxBatchWorker:
         observation = self.observe(tail_lines=160)
         current_command = observation.current_command
         if self.get_agent_state(observation) == AgentRuntimeState.READY:
-            self.wrapper_state = WrapperState.READY
+            self._mark_agent_ready_from_observation(observation)
             return
 
         if current_command in SHELL_COMMANDS:
@@ -4792,6 +4937,7 @@ class TmuxBatchWorker:
                 raise
             current_error = error
         while True:
+            raise_if_runtime_shutdown_requested("waiting for busy agent before turn start")
             self._confirm_busy_agent_for_turn_start_ready_wait(
                 error=current_error,
                 timeout_sec=timeout_sec,
@@ -5063,6 +5209,7 @@ class TmuxBatchWorker:
         resolved_reply = ""
         status_done_seen = task_status_path is None
         while time.monotonic() < deadline:
+            raise_if_runtime_shutdown_requested("waiting for turn reply")
             observation = self.observe(tail_lines=DEFAULT_CAPTURE_TAIL_LINES)
             if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while waiting for reply")
@@ -5128,9 +5275,11 @@ class TmuxBatchWorker:
             result_contract: TaskResultContract | None = None,
             timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
     ) -> CommandResult:
+        raise_if_runtime_shutdown_requested(f"starting turn {label}")
         started_at = _now_iso()
         last_timeout: TimeoutError | None = None
         for attempt in range(1, 3):
+            raise_if_runtime_shutdown_requested(f"starting turn {label}")
             previous_task_runtime_status = self.current_task_runtime_status
             previous_worker_status = str(self.read_state().get("status", "")).strip()
             turn_token = f"[[ACX_TURN:{uuid.uuid4().hex[:8]}:DONE]]"
@@ -5177,6 +5326,7 @@ class TmuxBatchWorker:
                     previous_task_runtime_status=previous_task_runtime_status,
                     previous_worker_status=previous_worker_status,
                 )
+                raise_if_runtime_shutdown_requested(f"submitting turn {label}")
                 baseline_observation = self.observe(tail_lines=DEFAULT_CAPTURE_TAIL_LINES)
                 baseline_visible = baseline_observation.visible_text
                 baseline_raw_log_tail = baseline_observation.raw_log_tail
@@ -5509,6 +5659,11 @@ class TmuxBatchWorker:
                     extra=timeout_extra,
                 )
                 return result
+            except RuntimeShutdownRequested:
+                self.current_task_runtime_status = read_task_status(task_status_path)
+                if self.current_task_runtime_status == TASK_STATUS_RUNNING:
+                    self.current_task_runtime_status = ""
+                raise
             except Exception as error:
                 finished_at = _now_iso()
                 current_visible = clean_ansi(self.capture_visible(200)) if self.pane_id and self.target_exists() else ""

@@ -1260,6 +1260,21 @@ def _replace_dead_review_ba(
     return replacement
 
 
+def _replace_dead_requirements_review_reviewer(
+        reviewer: ReviewerRuntime,
+        *,
+        project_dir: str | Path,
+        requirement_name: str,
+        progress: ReviewStageProgress | None = None,
+) -> ReviewerRuntime | None:
+    return recreate_reviewer_runtime(
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+        reviewer=reviewer,
+        progress=progress,
+    )
+
+
 def run_human_check_loop(
         *,
         handoff: RequirementsAnalystHandoff | None,
@@ -1595,6 +1610,12 @@ def repair_reviewer_outputs(
         final_error="审核器多次修复后仍未按协议更新文档",
         stage_label=REQUIREMENTS_REVIEW_TASK_NAME,
         progress=progress,
+        recreate_reviewer=lambda reviewer: _replace_dead_requirements_review_reviewer(
+            reviewer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            progress=progress,
+        ),
     )
 
 
@@ -1702,6 +1723,12 @@ def _run_review_feedback_loop(
             project_dir=paths["project_root"],
             progress=progress,
         ),
+        replace_dead_reviewer=lambda reviewer, _index: _replace_dead_requirements_review_reviewer(
+            reviewer,
+            project_dir=paths["project_root"],
+            requirement_name=requirement_name,
+            progress=progress,
+        ),
         main_label="需求评审需求分析师",
         reviewer_label_getter=reviewer_label_getter,
         notify=message,
@@ -1718,6 +1745,12 @@ def _run_review_feedback_loop(
         replace_dead_main_owner=lambda owner: _replace_dead_review_ba(
             owner,
             project_dir=paths["project_root"],
+            progress=progress,
+        ),
+        replace_dead_reviewer=lambda reviewer, _index: _replace_dead_requirements_review_reviewer(
+            reviewer,
+            project_dir=paths["project_root"],
+            requirement_name=requirement_name,
             progress=progress,
         ),
         main_label="需求评审需求分析师",
@@ -2016,6 +2049,12 @@ def run_requirements_review_stage(
                         project_dir=project_dir,
                         progress=progress,
                     ),
+                    replace_dead_reviewer=lambda reviewer, _index: _replace_dead_requirements_review_reviewer(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        progress=progress,
+                    ),
                     main_label="需求评审需求分析师",
                     reviewer_label_getter=reviewer_label_getter,
                     notify=message,
@@ -2032,6 +2071,12 @@ def run_requirements_review_stage(
                     replace_dead_main_owner=lambda owner: _replace_dead_review_ba(
                         owner,
                         project_dir=project_dir,
+                        progress=progress,
+                    ),
+                    replace_dead_reviewer=lambda reviewer, _index: _replace_dead_requirements_review_reviewer(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
                         progress=progress,
                     ),
                     main_label="需求评审需求分析师",

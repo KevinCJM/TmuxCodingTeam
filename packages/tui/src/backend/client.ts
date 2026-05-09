@@ -12,7 +12,7 @@ type BackendEnvelope = {
   error?: string
 }
 
-const BACKEND_STOP_KILL_GRACE_MS = 1500
+const BACKEND_STOP_KILL_GRACE_MS = 10000
 
 export type BackendEvent = {
   type: string

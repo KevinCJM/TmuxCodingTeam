@@ -613,6 +613,12 @@ class B01TerminalInteractionTests(unittest.TestCase):
             control_center.results_by_dir = {}
             control_center.futures = {}
             control_center.handle_by_dir = {}
+            control_center.config = SimpleNamespace(
+                vendor=SimpleNamespace(value="codex"),
+                model="gpt-5.4",
+                resolved_model="gpt-5.4",
+                reasoning_effort="high",
+            )
             control_center.tmux_runtime = SimpleNamespace(session_exists=lambda name: name == "sess-routing")
             control_center.run_store = SimpleNamespace(
                 ensure_worker=lambda work_dir: entry,
@@ -624,6 +630,10 @@ class B01TerminalInteractionTests(unittest.TestCase):
         self.assertEqual(snapshots[0]["agent_state"], "BUSY")
         self.assertEqual(snapshots[0]["health_status"], "alive")
         self.assertEqual(snapshots[0]["retry_count"], 1)
+        self.assertEqual(snapshots[0]["vendor"], "codex")
+        self.assertEqual(snapshots[0]["model"], "gpt-5.4")
+        self.assertEqual(snapshots[0]["resolved_model"], "gpt-5.4")
+        self.assertEqual(snapshots[0]["reasoning_effort"], "high")
 
     def test_refresh_worker_health_keeps_prelaunch_active_worker_starting(self):
         with tempfile.TemporaryDirectory() as tmpdir:

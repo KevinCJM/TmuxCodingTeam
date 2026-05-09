@@ -84,6 +84,7 @@ type StartupOptions = {
   initialRoute?: RouteName
   initialAction?: string
   initialArgv?: string[]
+  onExitRequest?: () => void | Promise<void>
 }
 
 type FooterPromptHostProps = {
@@ -193,6 +194,7 @@ const EMPTY_HITL_SNAPSHOT: HitlSnapshot = {
   questionPath: '',
   answerPath: '',
   summary: '',
+  attachCommand: '',
 }
 
 const EMPTY_ARTIFACTS_SNAPSHOT: ArtifactsSnapshot = {
@@ -331,6 +333,7 @@ function buildPromptBackedHitlSnapshot(active: PromptState | null, fallback: Hit
     questionPath: resolveHitlQuestionPath(active?.payload) || fallback.questionPath,
     answerPath: resolveHitlAnswerPath(active?.payload) || fallback.answerPath,
     summary: title || fallback.summary || '存在待处理 HITL',
+    attachCommand: resolveAgentAttachCommand(active?.payload) || fallback.attachCommand,
   }
 }
 
@@ -395,7 +398,7 @@ function FooterPromptHost(props: FooterPromptHostProps) {
   const hitlHints = createMemo(() => {
     if (!isHitlPrompt(props.active)) return []
     const questionPath = resolveHitlQuestionPath(props.active.payload)
-    const lines: string[] = []
+    const lines: string[] = [...buildAgentRecoveryHintLines(props.active.payload)]
     if (questionPath) lines.push(`问题文件: ${questionPath.split('/').pop() || questionPath}`)
     lines.push('Ctrl+K 查看完整问题')
     if (!questionPath) return lines
@@ -466,8 +469,51 @@ function DialogOverlay(props: DialogOverlayProps) {
   )
 }
 
+function stringPromptPayloadValue(value: unknown): string {
+  return String(value ?? '').trim()
+}
+
+function normalizeAttachCommand(value: unknown): string {
+  if (Array.isArray(value)) return value.map((item) => String(item)).join(' ').trim()
+  return stringPromptPayloadValue(value)
+}
+
+function promptIsAgentRecovery(payload: Record<string, unknown>): boolean {
+  const recoveryKind = stringPromptPayloadValue(payload.recovery_kind ?? payload.recoveryKind)
+  if (recoveryKind === 'agent_manual_intervention' || recoveryKind === 'agent_ready_timeout') return true
+  if (!resolveAgentAttachCommand(payload)) return false
+  const title = stringPromptPayloadValue(payload.title ?? payload.prompt_text ?? payload.promptText)
+  if (title.includes('需要人工介入') || title.includes('智能体启动超时')) return true
+  const options = Array.isArray(payload.options) ? payload.options : []
+  return options.some((item) => {
+    if (!item || typeof item !== 'object') return false
+    const option = item as Record<string, unknown>
+    const value = stringPromptPayloadValue(option.value)
+    const label = stringPromptPayloadValue(option.label)
+    return value === 'recheck_after_manual_intervention'
+      || value === 'worker_dead_after_manual_intervention'
+      || label.includes('进入 tmux')
+      || label.includes('按死亡处理')
+  })
+}
+
+function resolveAgentAttachCommand(payload: Record<string, unknown> | null | undefined): string {
+  if (!payload) return ''
+  const attachCommand = normalizeAttachCommand(payload.attach_command ?? payload.attachCommand)
+  if (attachCommand) return attachCommand
+  const sessionName = stringPromptPayloadValue(payload.session_name ?? payload.sessionName)
+  return sessionName ? `tmux attach -t ${sessionName}` : ''
+}
+
+function buildAgentRecoveryHintLines(payload: Record<string, unknown>): string[] {
+  if (!promptIsAgentRecovery(payload)) return []
+  const attachCommand = resolveAgentAttachCommand(payload)
+  return attachCommand ? [attachCommand] : []
+}
+
 function DialogPromptLayer(props: { active: PromptState; dialogActive: boolean; onSubmit: (value: unknown) => void }) {
   const hasPreview = createMemo(() => Boolean(resolvePreviewPath(props.active.payload)))
+  const hintLines = createMemo(() => buildAgentRecoveryHintLines(props.active.payload))
   const selectOptions = createMemo(() => withPromptBackOption(
     Array.isArray(props.active.payload.options) ? (props.active.payload.options as { value: string; label: string }[]) : [],
     props.active.payload,
@@ -490,6 +536,7 @@ function DialogPromptLayer(props: { active: PromptState; dialogActive: boolean; 
             title={String(props.active.payload.title ?? props.active.payload.prompt_text ?? '请选择')}
             defaultValue={String(props.active.payload.default_value ?? '')}
             options={selectOptions()}
+            hintLines={hintLines()}
             active={props.dialogActive}
             onSubmit={(value) => void props.onSubmit(value)}
           />
@@ -627,6 +674,10 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
     agentState: String(value.agent_state ?? value.agentState ?? ''),
     healthStatus: String(value.health_status ?? value.healthStatus ?? ''),
     currentTaskRuntimeStatus: String(value.current_task_runtime_status ?? value.currentTaskRuntimeStatus ?? ''),
+    vendor: String(value.vendor ?? ''),
+    model: String(value.model ?? ''),
+    resolvedModel: String(value.resolved_model ?? value.resolvedModel ?? ''),
+    reasoningEffort: String(value.reasoning_effort ?? value.reasoningEffort ?? ''),
     retryCount: Number(value.retry_count ?? value.retryCount ?? 0),
     note: String(value.note ?? ''),
     transcriptPath: String(value.transcript_path ?? value.transcriptPath ?? ''),
@@ -764,6 +815,7 @@ function normalizeHitlSnapshot(payload: Record<string, unknown>): HitlSnapshot {
     questionPath: String(payload.question_path ?? payload.questionPath ?? ''),
     answerPath: String(payload.answer_path ?? payload.answerPath ?? ''),
     summary: String(payload.summary ?? ''),
+    attachCommand: String(payload.attach_command ?? payload.attachCommand ?? ''),
   }
 }
 
@@ -1426,6 +1478,11 @@ export function App(props: StartupOptions) {
 
   useKeyboard(async (event) => {
     if (event.name) reportPresence('keyboard')
+    if (event.name === 'c' && event.ctrl) {
+      event.preventDefault()
+      await props.onExitRequest?.()
+      return
+    }
     if (activeDocumentPreview()) {
       if (event.name === 'k' && event.ctrl) {
         event.preventDefault()

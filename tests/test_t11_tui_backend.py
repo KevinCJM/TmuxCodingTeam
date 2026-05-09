@@ -33,6 +33,7 @@ from T11_tui_backend import (
 )
 from T10_tui_protocol import build_request
 from T09_terminal_ops import BridgePromptRequest
+from tmux_core.runtime.tmux_runtime import clear_runtime_shutdown_request, runtime_shutdown_requested
 
 
 class _FakeTarget:
@@ -182,7 +183,12 @@ class T11TuiBackendTests(unittest.TestCase):
         server._pending_prompt = PendingPromptState(  # noqa: SLF001
             prompt_id="prompt_1",
             prompt_type="multiline",
-            payload={"title": "HITL 第 1 轮回复", "question_path": "/tmp/question.md", "answer_path": "/tmp/answer.md"},
+            payload={
+                "title": "HITL 第 1 轮回复",
+                "question_path": "/tmp/question.md",
+                "answer_path": "/tmp/answer.md",
+                "session_name": "需求分析师-地奇星",
+            },
         )
         hitl = server._build_hitl_snapshot()  # noqa: SLF001
         app = server._build_app_snapshot()  # noqa: SLF001
@@ -190,6 +196,7 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(hitl["summary"], "HITL 第 1 轮回复")
         self.assertEqual(hitl["question_path"], "/tmp/question.md")
         self.assertEqual(hitl["answer_path"], "/tmp/answer.md")
+        self.assertEqual(hitl["attach_command"], "tmux attach -t 需求分析师-地奇星")
         self.assertTrue(app["pending_hitl"])
 
     def test_pending_hitl_snapshot_prefers_explicit_hitl_flag(self):
@@ -202,11 +209,13 @@ class T11TuiBackendTests(unittest.TestCase):
                 "question_path": "/tmp/question.md",
                 "answer_path": "/tmp/answer.md",
                 "is_hitl": True,
+                "attach_command": "tmux attach -t 测试工程师-天暴星",
             },
         )
         hitl = server._build_hitl_snapshot()  # noqa: SLF001
         self.assertTrue(hitl["pending"])
         self.assertEqual(hitl["question_path"], "/tmp/question.md")
+        self.assertEqual(hitl["attach_command"], "tmux attach -t 测试工程师-天暴星")
 
     def test_human_attention_manager_repeats_until_resolved(self):
         notifications: list[tuple[str, str, str]] = []
@@ -3597,6 +3606,75 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertTrue(center.closed)
         cleanup.assert_called_once_with(reason="tui_backend_shutdown")
 
+    def test_shutdown_requests_runtime_shutdown_and_new_server_clears_it(self):
+        clear_runtime_shutdown_request()
+        try:
+            writer = io.StringIO()
+            server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+            self.assertFalse(runtime_shutdown_requested())
+            server.shutdown(cleanup_tmux=False)
+            self.assertTrue(runtime_shutdown_requested())
+
+            TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            self.assertFalse(runtime_shutdown_requested())
+        finally:
+            clear_runtime_shutdown_request()
+
+    def test_shutdown_cleanup_can_run_after_initial_non_cleanup_shutdown(self):
+        writer = io.StringIO()
+        server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+        first_cleaned = server.shutdown(cleanup_tmux=False)
+        with patch("T11_tui_backend.cleanup_registered_tmux_workers", return_value=["sess-late"]), patch.object(
+            server,
+            "_cleanup_visible_tmux_workers",
+            return_value=[],
+        ), patch.object(
+            server,
+            "_cleanup_project_runtime_tmux_workers",
+            return_value=[],
+        ):
+            second_cleaned = server.shutdown(cleanup_tmux=True)
+        self.assertEqual(first_cleaned, [])
+        self.assertEqual(second_cleaned, ["sess-late"])
+
+    def test_shutdown_waits_for_runner_threads_before_tmux_cleanup(self):
+        clear_runtime_shutdown_request()
+        try:
+            writer = io.StringIO()
+            server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+            runner_stopped = threading.Event()
+            cleanup_observed_runner_stopped: list[bool] = []
+
+            def runner():
+                while not runtime_shutdown_requested():
+                    time.sleep(0.01)
+                runner_stopped.set()
+
+            thread = threading.Thread(target=runner, name="tui-backend-unit-runner")
+            thread.start()
+            server._workers["unit"] = thread  # noqa: SLF001
+
+            def fake_cleanup(*, reason):  # noqa: ANN001
+                cleanup_observed_runner_stopped.append(runner_stopped.is_set())
+                return []
+
+            with patch("T11_tui_backend.cleanup_registered_tmux_workers", side_effect=fake_cleanup), patch.object(
+                server,
+                "_cleanup_visible_tmux_workers",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_cleanup_project_runtime_tmux_workers",
+                return_value=[],
+            ):
+                server.shutdown(cleanup_tmux=True)
+
+            thread.join(timeout=1.0)
+            self.assertTrue(runner_stopped.is_set())
+            self.assertEqual(cleanup_observed_runner_stopped, [True])
+        finally:
+            clear_runtime_shutdown_request()
+
     def test_shutdown_cleans_visible_unregistered_tmux_workers_when_requested(self):
         writer = io.StringIO()
         server = TuiBackendServer(reader=io.StringIO(), writer=writer)
@@ -4017,6 +4095,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "config": {
                             "vendor": "gemini",
                             "model": "pro",
+                            "resolved_model": "pro",
                             "reasoning_effort": "high",
                             "proxy_url": "",
                         },
@@ -4045,6 +4124,10 @@ class T11TuiBackendTests(unittest.TestCase):
 
         self.assertEqual(workers[0]["agent_state"], "BUSY")
         self.assertEqual(workers[0]["health_note"], "alive")
+        self.assertEqual(workers[0]["vendor"], "gemini")
+        self.assertEqual(workers[0]["model"], "pro")
+        self.assertEqual(workers[0]["resolved_model"], "pro")
+        self.assertEqual(workers[0]["reasoning_effort"], "high")
 
     def test_runtime_scanned_stale_dead_worker_refreshes_when_session_is_live(self):
         with tempfile.TemporaryDirectory() as tmpdir:

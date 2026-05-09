@@ -10,6 +10,7 @@ from tmux_core.runtime.tmux_runtime import (
     worker_state_is_prelaunch_active,
 )
 from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_RECREATE,
     AGENT_INTERVENTION_WORKER_DEAD,
     request_file_noncompliance_intervention,
 )
@@ -97,6 +98,7 @@ def repair_reviewer_round_outputs(
     final_error: str,
     stage_label: str = "",
     progress: object | None = None,
+    recreate_reviewer: Callable[[TReviewer], TReviewer | None] | None = None,
 ) -> list[TReviewer]:
     reviewer_list = list(reviewers)
     if not reviewer_list:
@@ -156,7 +158,30 @@ def repair_reviewer_round_outputs(
             attempts_used=max_attempts,
             target_paths=target_paths,
             progress=progress,
+            allow_recreate=recreate_reviewer is not None,
         )
+        if decision == AGENT_INTERVENTION_RECREATE and recreate_reviewer is not None and representative is not None:
+            representative_key = key_func(representative)
+            replacement = recreate_reviewer(representative)
+            if replacement is None:
+                raise RuntimeError(f"{artifact_name_func(representative)} 重新创建失败，无法继续修复审核输出")
+            if representative_key in reviewer_index:
+                reviewer_list[reviewer_index[representative_key]] = replacement
+            else:
+                reviewer_list.append(replacement)
+            reviewer_index = {key_func(item): index for index, item in enumerate(reviewer_list)}
+            replacement_name = artifact_name_func(replacement)
+            replacement_prompts = check_job([replacement_name])
+            fix_prompt = replacement_prompts.get(replacement_name)
+            if fix_prompt:
+                fixed_reviewer = run_fix_turn(replacement, fix_prompt, max_attempts + 1)
+                if fixed_reviewer is None:
+                    reviewer_list = [item for item in reviewer_list if key_func(item) != key_func(replacement)]
+                else:
+                    reviewer_list[reviewer_index[key_func(replacement)]] = fixed_reviewer
+                reviewer_index = {key_func(item): index for index, item in enumerate(reviewer_list)}
+            prompts = check_job([artifact_name_func(item) for item in reviewer_list])
+            continue
         if decision == AGENT_INTERVENTION_WORKER_DEAD:
             survivors = [item for item in reviewer_list if not _owner_is_dead(item)]
             if len(survivors) != len(reviewer_list):
