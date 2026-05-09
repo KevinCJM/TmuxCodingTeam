@@ -1205,10 +1205,22 @@ def _read_worker_state_snapshot(
     *,
     session_exists_resolver: Callable[[str], bool] | None = None,
     session_context_resolver: Callable[[str, Mapping[str, Any], str | Path], bool] | None = None,
+    state_identity_resolver: Callable[[Mapping[str, Any], str | Path], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     state = _safe_json_read(state_path)
     if not state:
         return {}
+    recovered_identity: Mapping[str, Any] = {}
+    if state_identity_resolver is not None:
+        with contextlib.suppress(Exception):
+            recovered_identity = state_identity_resolver(state, state_path) or {}
+
+    def _state_or_identity(field_name: str, default: Any = "") -> Any:
+        value = state.get(field_name, "")
+        if str(value or "").strip():
+            return value
+        return recovered_identity.get(field_name, default)
+
     turn_bundle = _read_turn_bundle(str(state.get("current_turn_status_path", "")))
     task_bundle = _read_task_result_bundle(str(state.get("current_task_result_path", "")))
     artifact_paths: list[str] = []
@@ -1216,11 +1228,11 @@ def _read_worker_state_snapshot(
         for item in collection:
             if item and item not in artifact_paths:
                 artifact_paths.append(item)
-    session_name = str(state.get("session_name", "")).strip()
-    session_exists = False
+    session_name = str(_state_or_identity("session_name")).strip()
+    session_exists = bool(recovered_identity.get("session_exists", False))
     if session_name and session_context_resolver is not None:
         with contextlib.suppress(Exception):
-            session_exists = bool(session_context_resolver(session_name, state, state_path))
+            session_exists = bool(session_context_resolver(session_name, state, state_path)) or session_exists
         if (
             not session_exists
             and session_exists_resolver is not None
@@ -1265,9 +1277,14 @@ def _read_worker_state_snapshot(
     if not isinstance(config_payload, Mapping):
         config_payload = {}
     return {
-        "worker_id": str(state.get("worker_id") or state.get("raw_worker_id") or "").strip(),
+        "worker_id": str(
+            state.get("worker_id")
+            or state.get("raw_worker_id")
+            or recovered_identity.get("worker_id")
+            or ""
+        ).strip(),
         "session_name": session_name,
-        "work_dir": str(state.get("work_dir", "")).strip(),
+        "work_dir": str(_state_or_identity("work_dir")).strip(),
         "status": status,
         "workflow_stage": str(state.get("workflow_stage", "pending")).strip(),
         "agent_state": agent_state,
@@ -1286,9 +1303,14 @@ def _read_worker_state_snapshot(
         "session_exists": session_exists,
         "last_heartbeat_at": str(state.get("last_heartbeat_at", "")).strip(),
         "updated_at": str(state.get("updated_at", "")).strip(),
-        "project_dir": str(state.get("project_dir", "")).strip(),
-        "requirement_name": str(state.get("requirement_name", "")).strip(),
-        "workflow_action": str(state.get("workflow_action", "")).strip(),
+        "project_dir": str(
+            state.get("project_dir")
+            or recovered_identity.get("project_dir")
+            or recovered_identity.get("work_dir")
+            or ""
+        ).strip(),
+        "requirement_name": str(_state_or_identity("requirement_name")).strip(),
+        "workflow_action": str(_state_or_identity("workflow_action")).strip(),
         "stage_seq": str(state.get("stage_seq", "")).strip(),
         "run_id": str(state.get("run_id", "")).strip(),
         "vendor": str(config_payload.get("vendor", "")).strip(),
@@ -2008,11 +2030,22 @@ class BridgeCore:
         resolver = getattr(self._tmux_runtime, "session_matches_worker_state", None)
         return resolver if callable(resolver) else None
 
+    def _state_identity_resolver(self) -> Callable[[Mapping[str, Any], str | Path], Mapping[str, Any]] | None:
+        resolver = getattr(self._tmux_runtime, "worker_identity_for_runtime_dir", None)
+        if not callable(resolver):
+            return None
+
+        def _resolve(_state: Mapping[str, Any], state_path: str | Path) -> Mapping[str, Any]:
+            return resolver(Path(state_path).expanduser().resolve().parent)
+
+        return _resolve
+
     def _refresh_running_worker_snapshot_if_needed(self, state_path: str | Path) -> dict[str, Any]:
         snapshot = _read_worker_state_snapshot(
             state_path,
             session_exists_resolver=self._tmux_runtime.session_exists,
             session_context_resolver=self._session_context_resolver(),
+            state_identity_resolver=self._state_identity_resolver(),
         )
         if not snapshot:
             return {}
@@ -2044,6 +2077,7 @@ class BridgeCore:
                 state_path,
                 session_exists_resolver=self._tmux_runtime.session_exists,
                 session_context_resolver=self._session_context_resolver(),
+                state_identity_resolver=self._state_identity_resolver(),
             )
             if snapshot:
                 return snapshot

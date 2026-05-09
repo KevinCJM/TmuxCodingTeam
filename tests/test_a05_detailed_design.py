@@ -103,6 +103,35 @@ class A05DetailedDesignTests(unittest.TestCase):
         self.assertEqual(captured_requests[0].payload["stage_key"], "detailed_design_reviewer_specs")
         self.assertEqual(captured_requests[0].payload["stage_step_index"], 0)
 
+    def test_detailed_design_reviewer_role_prompts_allow_back_after_count(self):
+        from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, PROMPT_BACK_VALUE, use_terminal_ui
+
+        captured_requests: list[BridgePromptRequest] = []
+
+        def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
+            captured_requests.append(request)
+            if len(captured_requests) == 1:
+                return {"value": "1"}
+            if len(captured_requests) == 2:
+                return {"value": "default"}
+            raise RuntimeError("stop after default role prompt")
+
+        ui = BridgeTerminalUI(emit_event=lambda *_args, **_kwargs: None, request_prompt=request_prompt)
+
+        with use_terminal_ui(ui), self.assertRaisesRegex(RuntimeError, "stop after default role prompt"):
+            collect_interactive_reviewer_specs()
+
+        self.assertEqual(captured_requests[1].prompt_type, "select")
+        self.assertEqual(captured_requests[1].payload["title"], "第 1 个审核智能体 - 角色定义来源")
+        self.assertTrue(captured_requests[1].payload["allow_back"])
+        self.assertEqual(captured_requests[1].payload["back_value"], PROMPT_BACK_VALUE)
+        self.assertEqual(captured_requests[1].payload["stage_step_index"], 1)
+        self.assertEqual(captured_requests[2].prompt_type, "select")
+        self.assertEqual(captured_requests[2].payload["title"], "第 1 个审核智能体 - 选择默认角色定义")
+        self.assertTrue(captured_requests[2].payload["allow_back"])
+        self.assertEqual(captured_requests[2].payload["back_value"], PROMPT_BACK_VALUE)
+        self.assertEqual(captured_requests[2].payload["stage_step_index"], 2)
+
     def test_review_limit_force_hitl_contract_uses_outcome_scoped_artifacts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = build_detailed_design_paths(tmpdir, "需求A")

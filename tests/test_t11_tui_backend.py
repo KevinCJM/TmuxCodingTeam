@@ -3917,6 +3917,65 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(workers[0]["session_name"], "sess-runtime")
         self.assertTrue(workers[0]["session_exists"])
 
+    def test_development_snapshot_recovers_sparse_health_state_from_tmux_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            requirement_name = "需求A"
+            runtime_dir = project_dir / DEVELOPMENT_RUNTIME_ROOT_NAME / requirement_name / "development-review-abcd1234"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "agent_alive": True,
+                        "agent_started": True,
+                        "agent_ready": True,
+                        "agent_state": "READY",
+                        "health_status": "alive",
+                        "health_note": "alive",
+                        "updated_at": "2026-05-09T15:40:17",
+                        "last_heartbeat_at": "2026-05-09T15:40:17",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            class FakeTmuxRuntime:
+                backend = None
+
+                def session_exists(self, name):
+                    return name == "测试工程师-天慧星"
+
+                def session_matches_worker_state(self, name, state, state_path):  # noqa: ARG002
+                    return name == "测试工程师-天慧星"
+
+                def worker_identity_for_runtime_dir(self, current_runtime_dir):
+                    if Path(current_runtime_dir).resolve() != runtime_dir.resolve():
+                        return {}
+                    return {
+                        "session_name": "测试工程师-天慧星",
+                        "session_exists": True,
+                        "worker_id": "development-review-测试工程师",
+                        "work_dir": str(project_dir),
+                        "project_dir": str(project_dir),
+                        "requirement_name": requirement_name,
+                        "workflow_action": "stage.a07.start",
+                    }
+
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime = FakeTmuxRuntime()  # noqa: SLF001
+            server._context.project_dir = str(project_dir)  # noqa: SLF001
+            server._context.requirement_name = requirement_name  # noqa: SLF001
+
+            snapshot = server._build_development_snapshot()  # noqa: SLF001
+
+        self.assertEqual(len(snapshot["workers"]), 1)
+        self.assertEqual(snapshot["workers"][0]["session_name"], "测试工程师-天慧星")
+        self.assertEqual(snapshot["workers"][0]["worker_id"], "development-review-测试工程师")
+        self.assertEqual(snapshot["workers"][0]["requirement_name"], requirement_name)
+        self.assertEqual(snapshot["workers"][0]["workflow_action"], "stage.a07.start")
+        self.assertTrue(snapshot["workers"][0]["session_exists"])
+
     def test_runtime_scanned_running_worker_snapshots_mark_dead_when_session_is_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)

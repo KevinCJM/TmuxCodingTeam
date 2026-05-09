@@ -2093,7 +2093,7 @@ workspace (/directory)                                                     branc
                 return contract.validator(contract.status_path)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
+            root = Path(tmp_dir).resolve()
             contract_path = root / "review.json"
             artifact_path = root / "review.md"
 
@@ -2199,7 +2199,7 @@ workspace (/directory)                                                     branc
                 return contract.validator(contract.status_path)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
+            root = Path(tmp_dir).resolve()
             contract_path = root / "routing_status.json"
             artifact_path = root / "AGENTS.md"
 
@@ -6971,6 +6971,108 @@ Do you trust the files in this folder?
                     work_dir=runtime_a.parent.parent,
                 )
             )
+
+    def test_runtime_controller_recovers_worker_identity_by_runtime_dir(self):
+        class FakeBackend:
+            def __init__(self, runtime_dir: str):
+                self.runtime_dir = runtime_dir
+
+            def list_sessions(self):
+                return ["测试工程师-天慧星", "其他会话"]
+
+            def show_option(self, target, option_name):
+                if target != "测试工程师-天慧星":
+                    return ""
+                return {
+                    "@tmux_runtime_dir": self.runtime_dir,
+                    "@tmux_worker_id": "development-review-测试工程师",
+                    "@tmux_work_dir": "/tmp/project",
+                    "@tmux_requirement_name": "需求A",
+                    "@tmux_workflow_action": "stage.a07.start",
+                }.get(option_name, "")
+
+            def display_message(self, target, expression):
+                if target == "测试工程师-天慧星" and expression == "#{pane_id}":
+                    return "%9"
+                return ""
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            runtime_dir = Path(tmp_dir) / ".development_runtime" / "需求A" / "development-review-abcd1234"
+            runtime_dir.mkdir(parents=True)
+            controller = TmuxRuntimeController(FakeBackend(str(runtime_dir)))
+
+            identity = controller.worker_identity_for_runtime_dir(runtime_dir)
+
+        self.assertEqual(identity["session_name"], "测试工程师-天慧星")
+        self.assertEqual(identity["worker_id"], "development-review-测试工程师")
+        self.assertEqual(identity["work_dir"], "/tmp/project")
+        self.assertEqual(identity["project_dir"], "/tmp/project")
+        self.assertEqual(identity["requirement_name"], "需求A")
+        self.assertEqual(identity["workflow_action"], "stage.a07.start")
+        self.assertEqual(identity["pane_id"], "%9")
+        self.assertTrue(identity["session_exists"])
+
+    def test_nonintrusive_health_refresh_preserves_worker_metadata_when_state_is_sparse(self):
+        class FakeBackend:
+            def list_sessions(self):
+                return []
+
+        class SparseStateHealthWorker(TmuxBatchWorker):
+            def _capture_lightweight_observation(self):
+                return WorkerObservation(
+                    visible_text="",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-09T15:40:17",
+                    pane_title="DRL_PM",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir).resolve()
+            worker = SparseStateHealthWorker(
+                worker_id="development-review-测试工程师",
+                work_dir=root,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.5", reasoning_effort="high"),
+                runtime_root=root / ".development_runtime" / "需求A",
+                existing_session_name="测试工程师-天慧星",
+                existing_pane_id="%9",
+                backend=FakeBackend(),
+                runtime_metadata={
+                    "project_dir": str(root),
+                    "requirement_name": "需求A",
+                    "workflow_action": "stage.a07.start",
+                },
+            )
+            worker.state_path.write_text(
+                json.dumps(
+                    {
+                        "agent_started": True,
+                        "agent_state": "BUSY",
+                        "health_status": "unknown",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            worker.agent_started = True
+
+            worker._refresh_health_state_nonintrusive(notify_on_change=False)  # noqa: SLF001
+            payload = json.loads(worker.state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["worker_id"], "development-review-测试工程师")
+        self.assertEqual(payload["session_name"], "测试工程师-天慧星")
+        self.assertEqual(payload["work_dir"], str(root))
+        self.assertEqual(payload["project_dir"], str(root))
+        self.assertEqual(payload["requirement_name"], "需求A")
+        self.assertEqual(payload["workflow_action"], "stage.a07.start")
+        self.assertEqual(payload["config"]["vendor"], "codex")
+        self.assertEqual(payload["config"]["model"], "gpt-5.5")
+        self.assertEqual(payload["agent_state"], "READY")
 
     def test_worker_restart_and_kill_are_runtime_level_ops(self):
         class FakeBackend:

@@ -1040,6 +1040,31 @@ class TmuxRuntimeController:
             workflow_action=str(state.get("workflow_action", "") or "").strip(),
         )
 
+    def worker_identity_for_runtime_dir(self, runtime_dir: str | Path) -> dict[str, object]:
+        runtime_dir_text = _resolved_path_text(runtime_dir)
+        if not runtime_dir_text:
+            return {}
+        for session_name in sorted(_list_backend_session_names(self.backend)):
+            actual_runtime_dir = _backend_show_option(self.backend, session_name, TMUX_IDENTITY_RUNTIME_DIR_OPTION)
+            if not actual_runtime_dir or not _same_resolved_path(actual_runtime_dir, runtime_dir_text):
+                continue
+            work_dir = _backend_show_option(self.backend, session_name, TMUX_IDENTITY_WORK_DIR_OPTION)
+            pane_id = ""
+            with contextlib.suppress(Exception):
+                pane_id = str(self.backend.display_message(session_name, "#{pane_id}") or "").strip()
+            return {
+                "session_name": session_name,
+                "session_exists": True,
+                "pane_id": pane_id,
+                "runtime_dir": actual_runtime_dir,
+                "worker_id": _backend_show_option(self.backend, session_name, TMUX_IDENTITY_WORKER_ID_OPTION),
+                "work_dir": work_dir,
+                "project_dir": work_dir,
+                "requirement_name": _backend_show_option(self.backend, session_name, TMUX_IDENTITY_REQUIREMENT_NAME_OPTION),
+                "workflow_action": _backend_show_option(self.backend, session_name, TMUX_IDENTITY_WORKFLOW_ACTION_OPTION),
+            }
+        return {}
+
     def list_sessions(self) -> list[str]:
         return self.backend.list_sessions()
 
@@ -2980,8 +3005,10 @@ class TmuxBatchWorker:
             )
             if health_changed:
                 payload = dict(previous)
+                payload.update(self.runtime_metadata())
                 payload.update(
                     {
+                        "config": self.config.to_summary(),
                         "agent_alive": self.is_agent_alive(observation),
                         "agent_started": self.agent_started,
                         "agent_ready": snapshot.agent_state == AgentRuntimeState.READY.value,

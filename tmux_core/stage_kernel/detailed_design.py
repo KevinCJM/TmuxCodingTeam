@@ -120,6 +120,7 @@ from T08_pre_development import (
 from T09_terminal_ops import (
     PROMPT_BACK_VALUE,
     BridgeTerminalUI,
+    PromptBackRequested,
     collect_multiline_input,
     get_terminal_ui,
     maybe_launch_tui,
@@ -536,14 +537,23 @@ def _prompt_reviewer_select(
     default_value: str,
     prompt_text: str,
     progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
+    stage_key: str = "",
+    stage_step_index: int = 0,
 ) -> str:
     with _review_progress_context(progress):
-        return prompt_select_option(
-            title=title,
-            options=options,
-            default_value=default_value,
-            prompt_text=prompt_text,
-        )
+        with prompt_metadata(
+            allow_back=allow_back,
+            back_value=PROMPT_BACK_VALUE,
+            stage_key=stage_key,
+            stage_step_index=stage_step_index,
+        ):
+            return prompt_select_option(
+                title=title,
+                options=options,
+                default_value=default_value,
+                prompt_text=prompt_text,
+            )
 
 
 def _prompt_reviewer_text(
@@ -552,9 +562,118 @@ def _prompt_reviewer_text(
     default: str = "",
     allow_empty: bool = False,
     progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
+    stage_key: str = "",
+    stage_step_index: int = 0,
 ) -> str:
     with _review_progress_context(progress):
-        return prompt_with_default(prompt_text, default, allow_empty=allow_empty).strip()
+        with prompt_metadata(
+            allow_back=allow_back,
+            back_value=PROMPT_BACK_VALUE,
+            stage_key=stage_key,
+            stage_step_index=stage_step_index,
+        ):
+            return prompt_with_default(prompt_text, default, allow_empty=allow_empty).strip()
+
+
+def _collect_single_interactive_reviewer_spec(
+    *,
+    index: int,
+    default_roles: Sequence[str],
+    default_role_name: str,
+    progress: ReviewStageProgress | None,
+    stage_key: str,
+) -> DetailedDesignReviewerSpec:
+    role_source = "default"
+    role_name = default_role_name
+    prompt_source = "default"
+    role_prompt = ""
+    step = 0
+    while True:
+        try:
+            if step == 0:
+                role_source = _prompt_reviewer_select(
+                    title=f"第 {index} 个审核智能体 - 角色定义来源",
+                    options=(
+                        ("default", "默认角色"),
+                        ("custom", "自定义角色"),
+                    ),
+                    default_value=role_source or "default",
+                    prompt_text=f"选择第 {index} 个审核智能体的角色定义来源",
+                    progress=progress,
+                    allow_back=True,
+                    stage_key=stage_key,
+                    stage_step_index=1,
+                )
+                step = 1
+                continue
+            if step == 1:
+                if role_source == "default":
+                    role_name = _prompt_reviewer_select(
+                        title=f"第 {index} 个审核智能体 - 选择默认角色定义",
+                        options=tuple((item, item) for item in default_roles),
+                        default_value=role_name or default_role_name,
+                        prompt_text=f"选择第 {index} 个审核智能体的默认角色定义",
+                        progress=progress,
+                        allow_back=True,
+                        stage_key=stage_key,
+                        stage_step_index=2,
+                    )
+                else:
+                    role_name = _prompt_reviewer_text(
+                        f"输入第 {index} 个审核智能体的自定义角色定义",
+                        default="" if role_name == default_role_name else role_name,
+                        progress=progress,
+                        allow_back=True,
+                        stage_key=stage_key,
+                        stage_step_index=2,
+                    )
+                step = 2
+                continue
+            default_prompt = _default_prompt_for_role(role_name)
+            if default_prompt:
+                if step == 2:
+                    prompt_source = _prompt_reviewer_select(
+                        title=f"第 {index} 个审核智能体 - 角色定义提示词来源",
+                        options=(
+                            ("default", "默认提示词"),
+                            ("custom", "自定义提示词"),
+                        ),
+                        default_value=prompt_source or "default",
+                        prompt_text=f"选择第 {index} 个审核智能体的角色定义提示词来源",
+                        progress=progress,
+                        allow_back=True,
+                        stage_key=stage_key,
+                        stage_step_index=3,
+                    )
+                    if prompt_source == "default":
+                        return DetailedDesignReviewerSpec(role_name=role_name, role_prompt=default_prompt)
+                    step = 3
+                    continue
+                if step == 3:
+                    role_prompt = _prompt_reviewer_text(
+                        f"输入第 {index} 个审核智能体的自定义角色定义提示词",
+                        default=role_prompt or default_prompt,
+                        progress=progress,
+                        allow_back=True,
+                        stage_key=stage_key,
+                        stage_step_index=4,
+                    )
+                    return DetailedDesignReviewerSpec(role_name=role_name, role_prompt=role_prompt)
+            else:
+                role_prompt = _prompt_reviewer_text(
+                    f"输入第 {index} 个审核智能体的自定义角色定义提示词",
+                    default=role_prompt,
+                    progress=progress,
+                    allow_back=True,
+                    stage_key=stage_key,
+                    stage_step_index=3,
+                )
+                return DetailedDesignReviewerSpec(role_name=role_name, role_prompt=role_prompt)
+        except PromptBackRequested:
+            if step == 0:
+                raise
+            step -= 1
 
 
 def collect_interactive_reviewer_specs(
@@ -575,62 +694,34 @@ def collect_interactive_reviewer_specs(
     )
     collected_specs: list[DetailedDesignReviewerSpec] = []
     default_roles = list(DEFAULT_REVIEWER_ROLE_NAMES)
-    for index in range(1, reviewer_count + 1):
+    index = 1
+    while index <= reviewer_count:
         default_role_name = default_roles[(index - 1) % len(default_roles)]
-        role_source = _prompt_reviewer_select(
-            title=f"第 {index} 个审核智能体 - 角色定义来源",
-            options=(
-                ("default", "默认角色"),
-                ("custom", "自定义角色"),
-            ),
-            default_value="default",
-            prompt_text=f"选择第 {index} 个审核智能体的角色定义来源",
-            progress=progress,
-        )
-        if role_source == "default":
-            role_name = _prompt_reviewer_select(
-                title=f"第 {index} 个审核智能体 - 选择默认角色定义",
-                options=tuple((item, item) for item in default_roles),
-                default_value=default_role_name,
-                prompt_text=f"选择第 {index} 个审核智能体的默认角色定义",
-                progress=progress,
-            )
-        else:
-            role_name = _prompt_reviewer_text(
-                f"输入第 {index} 个审核智能体的自定义角色定义",
-                progress=progress,
-            )
-        default_prompt = _default_prompt_for_role(role_name)
-        if default_prompt:
-            prompt_source = _prompt_reviewer_select(
-                title=f"第 {index} 个审核智能体 - 角色定义提示词来源",
-                options=(
-                    ("default", "默认提示词"),
-                    ("custom", "自定义提示词"),
-                ),
-                default_value="default",
-                prompt_text=f"选择第 {index} 个审核智能体的角色定义提示词来源",
-                progress=progress,
-            )
-            if prompt_source == "default":
-                role_prompt = default_prompt
-            else:
-                role_prompt = _prompt_reviewer_text(
-                    f"输入第 {index} 个审核智能体的自定义角色定义提示词",
-                    default=default_prompt,
+        try:
+            collected_specs.append(
+                _collect_single_interactive_reviewer_spec(
+                    index=index,
+                    default_roles=default_roles,
+                    default_role_name=default_role_name,
                     progress=progress,
+                    stage_key=stage_key,
                 )
-        else:
-            role_prompt = _prompt_reviewer_text(
-                f"输入第 {index} 个审核智能体的自定义角色定义提示词",
-                progress=progress,
             )
-        collected_specs.append(
-            DetailedDesignReviewerSpec(
-                role_name=role_name,
-                role_prompt=role_prompt,
-            )
-        )
+            index += 1
+        except PromptBackRequested:
+            if not collected_specs:
+                reviewer_count = prompt_positive_int(
+                    "请输入详细设计审核智能体数量",
+                    reviewer_count,
+                    progress=progress,
+                    allow_back=allow_back_first_prompt,
+                    stage_key=stage_key,
+                    stage_step_index=0,
+                )
+                index = 1
+                continue
+            collected_specs.pop()
+            index -= 1
     return _finalize_reviewer_specs(collected_specs)
 
 
