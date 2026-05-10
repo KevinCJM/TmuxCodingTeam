@@ -3154,6 +3154,68 @@ class T11TuiBackendTests(unittest.TestCase):
             )
         )
 
+    def test_prompt_shutdown_does_not_mark_stage_failed(self):
+        clear_runtime_shutdown_request()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                project_dir = Path(tmpdir)
+                writer = io.StringIO()
+                server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+
+                def fake_runner(argv, preserve_workers=True):  # noqa: ANN001
+                    _ = argv
+                    _ = preserve_workers
+                    from T09_terminal_ops import prompt_select_option
+
+                    return prompt_select_option(
+                        title="HITL: 开发工程师 需要人工介入",
+                        options=(("recheck", "我已进入 tmux/修正文件，重新检查"),),
+                        default_value="recheck",
+                        prompt_text="请选择恢复方式",
+                        is_hitl=True,
+                    )
+
+                with patch("T11_tui_backend.run_development_stage", side_effect=fake_runner):
+                    server.handle_request(
+                        build_request(
+                            "stage.a07.start",
+                            {"argv": ["--project-dir", str(project_dir), "--requirement-name", "需求A"]},
+                            message_id="req_prompt_shutdown",
+                        )
+                    )
+                    deadline = time.time() + 2.0
+                    while time.time() < deadline:
+                        messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+                        if any(item.get("kind") == "event" and item.get("type") == "prompt.request" for item in messages):
+                            break
+                        time.sleep(0.01)
+                    server.shutdown(cleanup_tmux=False)
+                    for worker in list(server._workers.values()):  # noqa: SLF001
+                        worker.join(timeout=2.0)
+
+                messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+                failure_path = (
+                    project_dir
+                    / ".tmux_workflow"
+                    / "需求A"
+                    / "stages"
+                    / "stage_a07_start.failure.json"
+                )
+                failure_exists = failure_path.exists()
+
+            self.assertFalse(failure_exists)
+            self.assertFalse(any(item.get("kind") == "event" and item.get("type") == "error" for item in messages))
+            self.assertFalse(
+                any(
+                    item.get("kind") == "event"
+                    and item.get("type") == "stage.changed"
+                    and item.get("payload", {}).get("status") == "failed"
+                    for item in messages
+                )
+            )
+        finally:
+            clear_runtime_shutdown_request()
+
     def test_workflow_a00_failure_uses_current_stage_action_and_seq(self):
         writer = io.StringIO()
         server = TuiBackendServer(reader=io.StringIO(), writer=writer)
@@ -3368,6 +3430,38 @@ class T11TuiBackendTests(unittest.TestCase):
 
         self.assertFalse(stale_exists)
         self.assertTrue(workflow_exists)
+
+    def test_running_stage_state_clears_same_action_stale_failure_record(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            record_dir = project_dir / ".tmux_workflow" / "需求A" / "stages"
+            record_dir.mkdir(parents=True)
+            failure_payload = {
+                "action": "stage.a07.start",
+                "status": "failed",
+                "project_dir": str(project_dir),
+                "requirement_name": "需求A",
+                "error": "old failure",
+            }
+            failure_path = record_dir / "stage_a07_start.failure.json"
+            latest_path = record_dir / "latest_failure.json"
+            failure_path.write_text(json.dumps(failure_payload, ensure_ascii=False), encoding="utf-8")
+            latest_path.write_text(json.dumps(failure_payload, ensure_ascii=False), encoding="utf-8")
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a07.start")  # noqa: SLF001
+
+            server._emit_display_stage_state(  # noqa: SLF001
+                preferred_status="running",
+                preferred_action="stage.a07.start",
+                preferred_stage_seq=12,
+                source="runtime_inference",
+                force=True,
+            )
+            failure_exists = failure_path.exists()
+            latest_exists = latest_path.exists()
+
+        self.assertFalse(failure_exists)
+        self.assertFalse(latest_exists)
 
     def test_runtime_stage_change_marks_previous_forward_stage_completed(self):
         with tempfile.TemporaryDirectory() as tmpdir:

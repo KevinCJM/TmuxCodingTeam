@@ -2088,6 +2088,21 @@ def classify_agent_runtime_state(
     if not _agent_command_running(current_command, context.expected_current_commands):
         return AgentRuntimeState.DEAD
     if not context.agent_started:
+        if context.title_ready:
+            return AgentRuntimeState.READY
+        if context.title_busy:
+            return AgentRuntimeState.BUSY
+        if context.vendor == Vendor.OPENCODE and (
+                str(observation.visible_text or "").strip()
+                or str(observation.raw_log_tail or "").strip()
+        ):
+            surface_state = _classify_opencode_surface_state(
+                visible_text=observation.visible_text,
+                recent_log=observation.raw_log_tail,
+                current_command=current_command,
+            )
+            if surface_state in {AgentRuntimeState.READY, AgentRuntimeState.BUSY}:
+                return surface_state
         return AgentRuntimeState.STARTING
     if context.title_ready:
         return AgentRuntimeState.READY
@@ -2781,16 +2796,15 @@ class TmuxBatchWorker:
         self._tmux("set-window-option", "-t", f"{self.session_name}:0", "automatic-rename", "off")
         self._set_tmux_identity_options()
         self._abort_session_create_if_runtime_shutdown_requested("creating tmux session")
-        self._start_pipe_logging()
-        self._ensure_health_supervisor_started()
-        self._refresh_health_state_nonintrusive()
         self._log_event(
             "session_created",
             pane_id=self.pane_id,
             session_name=self.session_name,
             session_name_retry_count=retry_count,
         )
-        self._write_state(WorkerStatus.READY, note="session_created")
+        self._write_session_created_state_fast()
+        self._start_pipe_logging()
+        self._ensure_health_supervisor_started()
         return self.pane_id
 
     def _start_pipe_logging(self) -> None:
@@ -2839,6 +2853,60 @@ class TmuxBatchWorker:
             raw_log_tail=observation.raw_log_tail,
         )
         return observation
+
+    def _write_session_created_state_fast(self) -> None:
+        observed_at = _now_iso()
+        with self.state_lock:
+            previous = self.read_state()
+            payload: dict[str, object] = {
+                "worker_id": self.worker_id,
+                "runtime_worker_id": self.runtime_worker_id,
+                "session_name": self.session_name,
+                "pane_id": self.pane_id,
+                "work_dir": str(self.work_dir),
+                "status": WorkerStatus.READY.value,
+                "note": "session_created",
+                "updated_at": observed_at,
+                "config": self.config.to_summary(),
+                "log_path": str(self.log_path),
+                "raw_log_path": str(self.raw_log_path),
+                "transcript_path": str(self.transcript_path),
+                "agent_ready": False,
+                "agent_started": False,
+                "agent_alive": False,
+                "agent_state": AgentRuntimeState.STARTING.value,
+                "last_reply": self.last_reply,
+                "state_revision": int(previous.get("state_revision", 0)) + 1,
+                "last_writer": "TmuxBatchWorker",
+                "workflow_stage": str(previous.get("workflow_stage", "pending")),
+                "workflow_round": int(previous.get("workflow_round", 0)),
+                "health_status": "alive",
+                "health_note": "session_created",
+                "retry_count": int(previous.get("retry_count", 0)),
+                "last_log_offset": self.last_log_offset,
+                "auto_recovery_mode": str(previous.get("auto_recovery_mode", "standard")),
+                "recoverable": self.recoverable,
+                "result_status": str(previous.get("result_status", WorkerStatus.READY.value)),
+                "pane_title": self.last_pane_title,
+                "current_command": self.current_command,
+                "current_path": self.current_path or str(self.work_dir),
+                "last_turn_token": str(previous.get("last_turn_token", "")),
+                "last_prompt_hash": str(previous.get("last_prompt_hash", "")),
+                "last_heartbeat_at": observed_at,
+                "current_turn_id": str(previous.get("current_turn_id", "")),
+                "current_turn_phase": str(previous.get("current_turn_phase", "")),
+                "current_turn_status_path": str(previous.get("current_turn_status_path", "")),
+                "current_task_status_path": self.current_task_status_path or str(previous.get("current_task_status_path", "")),
+                "current_task_result_path": self.current_task_result_path or str(previous.get("current_task_result_path", "")),
+                "current_task_runtime_status": self.current_task_runtime_status or str(previous.get("current_task_runtime_status", "")),
+                "last_terminal_signature": self.last_terminal_signature,
+                "last_terminal_changed_at": self.last_terminal_changed_at,
+                "terminal_recently_changed": self.terminal_recently_changed,
+            }
+            payload.update(self._runtime_metadata)
+            _atomic_write_json(self.state_path, payload)
+        self._log_event("state_changed", status=WorkerStatus.READY.value, note="session_created")
+        _notify_runtime_state_changed_best_effort()
 
     def _write_state(self, status: WorkerStatus, *, note: str, extra: dict[str, object] | None = None) -> None:
         with self.state_lock:
@@ -2918,10 +2986,19 @@ class TmuxBatchWorker:
         return observation
 
     def _should_capture_visible_for_passive_health(self, observation: WorkerObservation) -> bool:
-        if not self.agent_started or not observation.session_exists or observation.pane_dead:
+        if not observation.session_exists or observation.pane_dead:
             return False
         current_command = observation.current_command or self.current_command
         if not self._agent_running(current_command):
+            return False
+        if self.config.vendor == Vendor.OPENCODE:
+            title = str(observation.pane_title or "").strip()
+            return (
+                    not self.agent_started
+                    or self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
+                    or title == "OpenCode"
+            )
+        if not self.agent_started:
             return False
         if self.config.vendor == Vendor.CODEX:
             return False
@@ -2973,6 +3050,8 @@ class TmuxBatchWorker:
             )
         agent_state = self.get_agent_state(passive_observation)
         self.agent_state = agent_state
+        if agent_state in {AgentRuntimeState.READY, AgentRuntimeState.BUSY}:
+            self.agent_started = True
         health_status = "pane_dead" if pane_dead else "alive"
         health_note = "pane_dead" if pane_dead else "alive"
         return WorkerHealthSnapshot(
@@ -4394,6 +4473,9 @@ class TmuxBatchWorker:
             return False, 0.0
         if observation.current_command in SHELL_COMMANDS or not self._agent_running(observation.current_command):
             return False, 0.0
+        agent_state = self.get_agent_state(observation)
+        if agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}:
+            return False, self._terminal_idle_elapsed_sec()
         if output_exists and invalid_output_stable_sec >= TASK_CONTRACT_STALL_IDLE_SEC:
             return True, invalid_output_stable_sec
         idle_elapsed = self._terminal_idle_elapsed_sec()
@@ -5354,10 +5436,19 @@ class TmuxBatchWorker:
                     previous_worker_status=previous_worker_status,
                 )
                 raise_if_runtime_shutdown_requested(f"submitting turn {label}")
-                baseline_observation = self.observe(tail_lines=DEFAULT_CAPTURE_TAIL_LINES)
-                baseline_visible = baseline_observation.visible_text
-                baseline_raw_log_tail = baseline_observation.raw_log_tail
+                needs_pre_submit_observation = (
+                    result_contract is not None
+                    or (completion_contract is None and result_contract is None)
+                )
+                baseline_observation: WorkerObservation | None = None
+                baseline_visible = ""
+                baseline_raw_log_tail = ""
                 baseline_reply = self.last_reply
+                if needs_pre_submit_observation:
+                    baseline_observation = self.observe(tail_lines=DEFAULT_CAPTURE_TAIL_LINES)
+                    baseline_visible = baseline_observation.visible_text
+                    baseline_raw_log_tail = baseline_observation.raw_log_tail
+                    baseline_reply = self.last_reply
                 self._write_state(
                     WorkerStatus.RUNNING,
                     note=f"turn:{label}",
@@ -5393,6 +5484,8 @@ class TmuxBatchWorker:
                     )
                 elif result_contract is not None:
                     if self._can_finalize_task_result_from_contract_without_helper(result_contract):
+                        if baseline_observation is None:
+                            raise AssertionError("result contract turn requires pre-submit baseline observation")
                         task_result = self._wait_for_ready_task_result_after_submit(
                             contract=result_contract,
                             task_status_path=task_status_path,

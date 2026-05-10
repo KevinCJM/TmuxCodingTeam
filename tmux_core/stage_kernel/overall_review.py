@@ -97,6 +97,12 @@ from tmux_core.stage_kernel.shared_review import (
     worker_has_provider_auth_error,
     worker_has_provider_runtime_error,
 )
+from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_RECHECK,
+    AGENT_INTERVENTION_RECREATE,
+    AGENT_INTERVENTION_WORKER_DEAD,
+    request_worker_manual_intervention,
+)
 from tmux_core.stage_kernel.turn_output_goals import (
     OutcomeGoal,
     TaskTurnGoal,
@@ -725,6 +731,83 @@ def normalize_overall_review_reviewer_runtime(
     )
 
 
+def _overall_reviewer_display_name(reviewer: ReviewerRuntime) -> str:
+    return str(reviewer.worker.session_name or reviewer.reviewer_name).strip() or reviewer.reviewer_name
+
+
+def _overall_reviewer_target_paths(
+    reviewer: ReviewerRuntime,
+    paths: dict[str, Path] | None = None,
+) -> tuple[Path, ...]:
+    targets: list[Path] = [reviewer.review_md_path, reviewer.review_json_path]
+    if paths:
+        for key in ("task_json_path", "developer_output_path", "state_path"):
+            target = paths.get(key)
+            if target is not None:
+                targets.append(target)
+    return tuple(targets)
+
+
+def _kill_overall_reviewer_best_effort(reviewer: ReviewerRuntime) -> None:
+    with contextlib.suppress(Exception):
+        reviewer.worker.request_kill()
+
+
+def _prompt_overall_reviewer_recovery(
+    reviewer: ReviewerRuntime,
+    *,
+    reason_text: str,
+    paths: dict[str, Path] | None = None,
+    progress: ReviewStageProgress | None = None,
+) -> str:
+    return request_worker_manual_intervention(
+        stage_label="复核阶段",
+        role_label=_overall_reviewer_display_name(reviewer),
+        worker=reviewer.worker,
+        reason_text=reason_text,
+        target_paths=_overall_reviewer_target_paths(reviewer, paths),
+        progress=progress,
+        allow_recreate=True,
+        allow_worker_dead=True,
+    )
+
+
+def _recreate_overall_reviewer_from_hitl(
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    reviewer: ReviewerRuntime,
+    reviewer_spec: DevelopmentReviewerSpec,
+    progress: ReviewStageProgress | None,
+    force_model_change: bool,
+    required_reconfiguration: bool = False,
+    reason_text: str = "",
+    carry_failure_from: ReviewerRuntime | None = None,
+) -> ReviewerRuntime | None:
+    replacement = recreate_development_reviewer_runtime(
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+        reviewer=reviewer,
+        reviewer_spec=reviewer_spec,
+        progress=progress,
+        force_model_change=force_model_change,
+        required_reconfiguration=required_reconfiguration,
+        reason_text=reason_text,
+        reuse_existing_selection=not force_model_change,
+    )
+    if replacement is None:
+        message(f"{_overall_reviewer_display_name(reviewer)} 重新创建失败，请重新选择恢复方式。")
+        return None
+    _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
+    if carry_failure_from is not None and not force_model_change:
+        replacement = carry_reviewer_failure_state(replacement, previous=carry_failure_from)
+    return normalize_overall_review_reviewer_runtime(
+        replacement,
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+    )
+
+
 def resolve_overall_review_reviewer_specs(
     args: argparse.Namespace,
     *,
@@ -1219,49 +1302,45 @@ def _run_single_overall_review_reviewer_init(
             if is_worker_death_error(error):
                 failure_reason = describe_reviewer_failure_reason(error, current_reviewer.worker)
                 failed_reviewer = note_reviewer_failure(current_reviewer, reason_text=failure_reason)
-                if reviewer_requires_manual_model_reconfiguration(failed_reviewer):
+                reason_text = f"{reviewer_display_name} 初始化失败或已死亡。\n{failure_reason or str(error)}".strip()
+                decision = _prompt_overall_reviewer_recovery(
+                    failed_reviewer,
+                    reason_text=reason_text,
+                    paths=paths,
+                    progress=progress,
+                )
+                if decision == AGENT_INTERVENTION_RECHECK:
+                    current_reviewer = failed_reviewer
+                    continue
+                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                    _kill_overall_reviewer_best_effort(failed_reviewer)
+                    message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                    return None
+                if decision != AGENT_INTERVENTION_RECREATE:
+                    continue
+                force_model_change = reviewer_requires_manual_model_reconfiguration(failed_reviewer)
+                if force_model_change:
                     reason_text = build_reviewer_failure_reconfiguration_reason(
                         failed_reviewer,
                         role_label=reviewer_display_name,
                         failure_reason=failure_reason,
                     )
                     mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
-                    replacement = recreate_development_reviewer_runtime(
-                        project_dir=project_dir,
-                        requirement_name=requirement_name,
-                        reviewer=failed_reviewer,
-                        reviewer_spec=reviewer_spec,
-                        progress=progress,
-                        force_model_change=True,
-                        required_reconfiguration=True,
-                        reason_text=reason_text,
-                    )
-                    if replacement is None:
-                        raise RuntimeError(f"{reviewer_display_name} 初始化失败，且未能重建审核智能体") from error
-                    _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
-                    current_reviewer = normalize_overall_review_reviewer_runtime(
-                        replacement,
-                        project_dir=project_dir,
-                        requirement_name=requirement_name,
-                    )
-                    continue
-                replacement = recreate_development_reviewer_runtime(
+                replacement = _recreate_overall_reviewer_from_hitl(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
                     reviewer=failed_reviewer,
                     reviewer_spec=reviewer_spec,
                     progress=progress,
-                    force_model_change=False,
+                    force_model_change=force_model_change,
+                    required_reconfiguration=force_model_change,
+                    reason_text=reason_text,
+                    carry_failure_from=failed_reviewer,
                 )
                 if replacement is None:
-                    message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
-                    return None
-                _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
-                current_reviewer = normalize_overall_review_reviewer_runtime(
-                    carry_reviewer_failure_state(replacement, previous=failed_reviewer),
-                    project_dir=project_dir,
-                    requirement_name=requirement_name,
-                )
+                    current_reviewer = failed_reviewer
+                else:
+                    current_reviewer = replacement
                 continue
             if is_recoverable_startup_failure(error, current_reviewer.worker):
                 reason_text = (
@@ -1271,8 +1350,22 @@ def _run_single_overall_review_reviewer_init(
                     if worker_has_provider_runtime_error(current_reviewer.worker)
                     else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
                 )
+                decision = _prompt_overall_reviewer_recovery(
+                    current_reviewer,
+                    reason_text=reason_text,
+                    paths=paths,
+                    progress=progress,
+                )
+                if decision == AGENT_INTERVENTION_RECHECK:
+                    continue
+                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                    _kill_overall_reviewer_best_effort(current_reviewer)
+                    message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                    return None
+                if decision != AGENT_INTERVENTION_RECREATE:
+                    continue
                 mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
-                replacement = recreate_development_reviewer_runtime(
+                replacement = _recreate_overall_reviewer_from_hitl(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
                     reviewer=current_reviewer,
@@ -1282,14 +1375,8 @@ def _run_single_overall_review_reviewer_init(
                     required_reconfiguration=True,
                     reason_text=reason_text,
                 )
-                if replacement is None:
-                    raise RuntimeError(f"{reviewer_display_name} 初始化失败，且未能重建审核智能体") from error
-                _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
-                current_reviewer = normalize_overall_review_reviewer_runtime(
-                    replacement,
-                    project_dir=project_dir,
-                    requirement_name=requirement_name,
-                )
+                if replacement is not None:
+                    current_reviewer = replacement
                 continue
             raise
 
@@ -1379,8 +1466,22 @@ def run_overall_review_turn_with_recreation(
                     if provider_runtime_error
                     else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
                 )
+                decision = _prompt_overall_reviewer_recovery(
+                    current_reviewer,
+                    reason_text=reason_text,
+                    paths=paths,
+                    progress=progress,
+                )
+                if decision == AGENT_INTERVENTION_RECHECK:
+                    continue
+                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                    _kill_overall_reviewer_best_effort(current_reviewer)
+                    message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                    return None
+                if decision != AGENT_INTERVENTION_RECREATE:
+                    continue
                 mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
-                replacement = recreate_development_reviewer_runtime(
+                replacement = _recreate_overall_reviewer_from_hitl(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
                     reviewer=current_reviewer,
@@ -1391,8 +1492,7 @@ def run_overall_review_turn_with_recreation(
                     reason_text=reason_text,
                 )
                 if replacement is None:
-                    raise RuntimeError(f"{reviewer_display_name} 无法继续，且未能重建审核智能体") from error
-                _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
+                    continue
                 initialized = _run_single_overall_review_reviewer_init(
                     replacement,
                     project_dir=project_dir,
@@ -1402,44 +1502,50 @@ def run_overall_review_turn_with_recreation(
                     progress=progress,
                 )
                 if initialized is None:
-                    raise RuntimeError(f"{reviewer_display_name} 重建后初始化失败") from error
+                    return None
                 current_reviewer = initialized
                 continue
             if is_worker_death_error(error):
                 failure_reason = describe_reviewer_failure_reason(error, current_reviewer.worker)
                 failed_reviewer = note_reviewer_failure(current_reviewer, reason_text=failure_reason)
-                if reviewer_requires_manual_model_reconfiguration(failed_reviewer):
+                reason_text = f"{reviewer_display_name} 本轮执行失败或已死亡。\n{failure_reason or str(error)}".strip()
+                decision = _prompt_overall_reviewer_recovery(
+                    failed_reviewer,
+                    reason_text=reason_text,
+                    paths=paths,
+                    progress=progress,
+                )
+                if decision == AGENT_INTERVENTION_RECHECK:
+                    current_reviewer = failed_reviewer
+                    continue
+                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                    _kill_overall_reviewer_best_effort(failed_reviewer)
+                    message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                    return None
+                if decision != AGENT_INTERVENTION_RECREATE:
+                    continue
+                force_model_change = reviewer_requires_manual_model_reconfiguration(failed_reviewer)
+                if force_model_change:
                     reason_text = build_reviewer_failure_reconfiguration_reason(
                         failed_reviewer,
                         role_label=reviewer_display_name,
                         failure_reason=failure_reason,
                     )
                     mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
-                    replacement = recreate_development_reviewer_runtime(
-                        project_dir=project_dir,
-                        requirement_name=requirement_name,
-                        reviewer=failed_reviewer,
-                        reviewer_spec=reviewer_spec,
-                        progress=progress,
-                        force_model_change=True,
-                        required_reconfiguration=True,
-                        reason_text=reason_text,
-                    )
-                else:
-                    replacement = recreate_development_reviewer_runtime(
-                        project_dir=project_dir,
-                        requirement_name=requirement_name,
-                        reviewer=failed_reviewer,
-                        reviewer_spec=reviewer_spec,
-                        progress=progress,
-                        force_model_change=False,
-                    )
+                replacement = _recreate_overall_reviewer_from_hitl(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    reviewer=failed_reviewer,
+                    reviewer_spec=reviewer_spec,
+                    progress=progress,
+                    force_model_change=force_model_change,
+                    required_reconfiguration=force_model_change,
+                    reason_text=reason_text,
+                    carry_failure_from=failed_reviewer,
+                )
                 if replacement is None:
-                    message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
-                    return None
-                _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
-                if not reviewer_requires_manual_model_reconfiguration(failed_reviewer):
-                    replacement = carry_reviewer_failure_state(replacement, previous=failed_reviewer)
+                    current_reviewer = failed_reviewer
+                    continue
                 initialized = _run_single_overall_review_reviewer_init(
                     replacement,
                     project_dir=project_dir,
@@ -1449,13 +1555,26 @@ def run_overall_review_turn_with_recreation(
                     progress=progress,
                 )
                 if initialized is None:
-                    message(f"{reviewer_display_name} 已死亡，重建后初始化失败，当前阶段将忽略该审核智能体。")
                     return None
                 current_reviewer = initialized
                 continue
             if try_resume_worker(current_reviewer.worker, timeout_sec=60.0):
                 continue
-            replacement = recreate_development_reviewer_runtime(
+            decision = _prompt_overall_reviewer_recovery(
+                current_reviewer,
+                reason_text=f"{reviewer_display_name} 无法继续执行当前复核任务。",
+                paths=paths,
+                progress=progress,
+            )
+            if decision == AGENT_INTERVENTION_RECHECK:
+                continue
+            if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                _kill_overall_reviewer_best_effort(current_reviewer)
+                message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                return None
+            if decision != AGENT_INTERVENTION_RECREATE:
+                continue
+            replacement = _recreate_overall_reviewer_from_hitl(
                 project_dir=project_dir,
                 requirement_name=requirement_name,
                 reviewer=current_reviewer,
@@ -1464,8 +1583,7 @@ def run_overall_review_turn_with_recreation(
                 force_model_change=False,
             )
             if replacement is None:
-                raise RuntimeError(f"{reviewer_display_name} 无法继续，系统不会自动恢复，请人工介入处理。") from error
-            _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
+                continue
             initialized = _run_single_overall_review_reviewer_init(
                 replacement,
                 project_dir=project_dir,
@@ -1475,7 +1593,7 @@ def run_overall_review_turn_with_recreation(
                 progress=progress,
             )
             if initialized is None:
-                raise RuntimeError(f"{reviewer_display_name} 重建后初始化失败") from error
+                return None
             current_reviewer = initialized
 
 

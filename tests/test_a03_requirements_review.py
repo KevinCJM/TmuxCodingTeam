@@ -42,6 +42,7 @@ from T08_pre_development import (
     build_pre_development_task_record_path,
     ensure_pre_development_task_record,
 )
+from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 
 
 class _FakeWorker:
@@ -2023,6 +2024,9 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 "A03_RequirementsReview._run_reviewer_turn",
                 side_effect=fake_run_reviewer_turn,
             ), patch(
+                "A03_RequirementsReview.request_worker_manual_intervention",
+                return_value=AGENT_INTERVENTION_RECREATE,
+            ), patch(
                 "A03_RequirementsReview.recreate_reviewer_runtime",
                 return_value=recreated,
             ) as recreate_mock:
@@ -2138,6 +2142,9 @@ class A03RequirementsReviewTests(unittest.TestCase):
             with patch(
                 "A03_RequirementsReview._run_reviewer_turn",
                 side_effect=fake_run_reviewer_turn,
+            ), patch(
+                "A03_RequirementsReview.request_worker_manual_intervention",
+                return_value=AGENT_INTERVENTION_RECREATE,
             ), patch(
                 "A03_RequirementsReview.create_reviewer_runtime",
                 return_value=recreated,
@@ -2258,6 +2265,9 @@ class A03RequirementsReviewTests(unittest.TestCase):
             with patch(
                 "A03_RequirementsReview._run_reviewer_turn",
                 side_effect=fake_run_reviewer_turn,
+            ), patch(
+                "A03_RequirementsReview.request_worker_manual_intervention",
+                return_value=AGENT_INTERVENTION_RECREATE,
             ), patch(
                 "A03_RequirementsReview.create_reviewer_runtime",
                 return_value=recreated,

@@ -73,6 +73,17 @@ def _read_worker_state(worker: object | None) -> dict[str, object]:
     return state if isinstance(state, dict) else {}
 
 
+def _kill_worker_best_effort(owner: object | None) -> None:
+    worker = _resolve_worker(owner)
+    request_kill = getattr(worker, "request_kill", None)
+    if not callable(request_kill):
+        return
+    try:
+        request_kill()
+    except Exception:
+        return
+
+
 def _reviewer_ready_check_should_be_skipped(reviewer: object | None) -> bool:
     worker = _resolve_worker(reviewer)
     state = _read_worker_state(worker)
@@ -115,20 +126,36 @@ def drop_dead_reviewers(
 ) -> list[TReviewer]:
     survivors: list[TReviewer] = []
     for index, reviewer in enumerate(reviewers, start=1):
-        if not _is_dead(reviewer):
-            survivors.append(reviewer)
-            continue
-        if replace_reviewer is not None:
-            replacement = replace_reviewer(reviewer, index)
-            if replacement is not None:
-                survivors.append(replacement)
+        current_reviewer = reviewer
+        while True:
+            if not _is_dead(current_reviewer):
+                survivors.append(current_reviewer)
+                break
+            label = reviewer_label_getter(current_reviewer, index) if reviewer_label_getter is not None else f"审核智能体 {index}"
+            decision = _request_ready_intervention(
+                role_label=label,
+                worker=_resolve_worker(current_reviewer),
+                error=_build_dead_ready_error(current_reviewer, role_label=label),
+                allow_recreate=replace_reviewer is not None,
+                allow_worker_dead=True,
+            )
+            if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                _kill_worker_best_effort(current_reviewer)
                 if notify is not None:
-                    label = reviewer_label_getter(reviewer, index) if reviewer_label_getter is not None else f"审核智能体 {index}"
-                    notify(f"{label} 已死亡，已重建审核智能体继续当前阶段。")
+                    notify(f"{label} 已按死亡处理，后续将忽略该审核智能体。")
+                break
+            if decision == AGENT_INTERVENTION_RECREATE and replace_reviewer is not None:
+                replacement = replace_reviewer(current_reviewer, index)
+                if replacement is None:
+                    if notify is not None:
+                        notify(f"{label} 重新创建失败，请重新选择恢复方式。")
+                    continue
+                current_reviewer = replacement
+                if notify is not None:
+                    notify(f"{label} 已重建审核智能体继续当前阶段。")
                 continue
-        if notify is not None:
-            label = reviewer_label_getter(reviewer, index) if reviewer_label_getter is not None else f"审核智能体 {index}"
-            notify(f"{label} 已死亡，后续将忽略该审核智能体。")
+            if decision == AGENT_INTERVENTION_RECHECK:
+                continue
     return survivors
 
 
@@ -374,6 +401,7 @@ def run_reviewer_phase_with_death_handling(
                 allow_worker_dead=True,
             )
             if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                _kill_worker_best_effort(current_reviewer)
                 if notify is not None:
                     notify(f"{label} 已按死亡处理，后续将忽略该审核智能体。")
                 break
@@ -381,8 +409,8 @@ def run_reviewer_phase_with_death_handling(
                 replacement = replace_dead_reviewer(current_reviewer, index)
                 if replacement is None:
                     if notify is not None:
-                        notify(f"{label} 重新创建失败，后续将忽略该审核智能体。")
-                    break
+                        notify(f"{label} 重新创建失败，请重新选择恢复方式。")
+                    continue
                 current_reviewer = replacement
                 continue
             if decision == AGENT_INTERVENTION_RECHECK:

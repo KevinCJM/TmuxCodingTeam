@@ -36,6 +36,7 @@ from A08_OverallReview import (
 )
 from tmux_core.runtime.contracts import TaskResultContract, resolve_task_result_decision
 from tmux_core.stage_kernel.shared_review import ReviewAgentHandoff, ReviewAgentSelection, ReviewerRuntime
+from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 
 
 class _FakeWorker:
@@ -700,6 +701,9 @@ class A08OverallReviewTests(unittest.TestCase):
                 "A08_OverallReview.is_worker_death_error",
                 side_effect=lambda error: str(error) == "dead worker",
             ), patch(
+                "A08_OverallReview.request_worker_manual_intervention",
+                return_value=AGENT_INTERVENTION_RECREATE,
+            ), patch(
                 "A08_OverallReview.recreate_development_reviewer_runtime",
                 return_value=replacement,
             ), patch(
@@ -769,6 +773,9 @@ class A08OverallReviewTests(unittest.TestCase):
             with patch(
                 "A08_OverallReview.run_completion_turn_with_repair",
                 side_effect=death_death_success,
+            ), patch(
+                "A08_OverallReview.request_worker_manual_intervention",
+                return_value=AGENT_INTERVENTION_RECREATE,
             ), patch(
                 "A08_OverallReview.recreate_development_reviewer_runtime",
                 side_effect=[replacement1, replacement2],

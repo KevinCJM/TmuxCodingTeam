@@ -332,14 +332,19 @@ class RoleOrchestrationTests(unittest.TestCase):
         alive = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True), reviewer_name="alive")
         notices: list[str] = []
 
-        survivors = drop_dead_reviewers(
-            [fresh, launched, alive],
-            reviewer_label_getter=lambda reviewer, _index: reviewer.reviewer_name,
-            notify=notices.append,
-        )
+        with mock.patch(
+            "tmux_core.stage_kernel.death_orchestration.request_worker_manual_intervention",
+            return_value=AGENT_INTERVENTION_WORKER_DEAD,
+        ) as prompt:
+            survivors = drop_dead_reviewers(
+                [fresh, launched, alive],
+                reviewer_label_getter=lambda reviewer, _index: reviewer.reviewer_name,
+                notify=notices.append,
+            )
 
         self.assertEqual([item.reviewer_name for item in survivors], ["fresh", "alive"])
-        self.assertEqual(notices, ["launched 已死亡，后续将忽略该审核智能体。"])
+        self.assertEqual(notices, ["launched 已按死亡处理，后续将忽略该审核智能体。"])
+        prompt.assert_called_once()
 
     def test_replace_dead_main_keeps_fresh_dead_owner_until_launch(self):
         fresh_main = SimpleNamespace(worker=_DeathAwareFakeWorker("DEAD", launched=False))
@@ -435,37 +440,47 @@ class RoleOrchestrationTests(unittest.TestCase):
         busy = SimpleNamespace(worker=_DeathAwareFakeWorker("BUSY", launched=True), reviewer_name="busy")
         notices: list[str] = []
 
-        result, reviewers, current_main = run_main_phase_with_death_handling(
-            main,
-            reviewers=[dead, busy],
-            run_phase=lambda owner: owner,
-            replace_dead_main_owner=lambda owner: owner,
-            reviewer_label_getter=lambda item, _index: item.reviewer_name,
-            notify=notices.append,
-        )
+        with mock.patch(
+            "tmux_core.stage_kernel.death_orchestration.request_worker_manual_intervention",
+            return_value=AGENT_INTERVENTION_WORKER_DEAD,
+        ) as prompt:
+            result, reviewers, current_main = run_main_phase_with_death_handling(
+                main,
+                reviewers=[dead, busy],
+                run_phase=lambda owner: owner,
+                replace_dead_main_owner=lambda owner: owner,
+                reviewer_label_getter=lambda item, _index: item.reviewer_name,
+                notify=notices.append,
+            )
 
         self.assertIs(result, main)
         self.assertIs(current_main, main)
         self.assertEqual(reviewers, [busy])
         self.assertEqual(busy.worker.ensure_calls, 0)
-        self.assertEqual(notices, ["dead 已死亡，后续将忽略该审核智能体。"])
+        self.assertEqual(notices, ["dead 已按死亡处理，后续将忽略该审核智能体。"])
+        prompt.assert_called_once()
 
     def test_run_reviewer_phase_with_death_handling_replaces_dead_reviewer(self):
         main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
         dead_reviewer = SimpleNamespace(worker=_DeathAwareFakeWorker("DEAD", launched=True), reviewer_name="dead")
         replacement = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True), reviewer_name="replacement")
 
-        updated, current_main = run_reviewer_phase_with_death_handling(
-            main,
-            [dead_reviewer],
-            run_phase=lambda reviewers: list(reviewers),
-            replace_dead_main_owner=lambda owner: owner,
-            replace_dead_reviewer=lambda reviewer, _index: replacement if reviewer is dead_reviewer else reviewer,
-            reviewer_label_getter=lambda reviewer, _index: reviewer.reviewer_name,
-        )
+        with mock.patch(
+            "tmux_core.stage_kernel.death_orchestration.request_worker_manual_intervention",
+            return_value=AGENT_INTERVENTION_RECREATE,
+        ) as prompt:
+            updated, current_main = run_reviewer_phase_with_death_handling(
+                main,
+                [dead_reviewer],
+                run_phase=lambda reviewers: list(reviewers),
+                replace_dead_main_owner=lambda owner: owner,
+                replace_dead_reviewer=lambda reviewer, _index: replacement if reviewer is dead_reviewer else reviewer,
+                reviewer_label_getter=lambda reviewer, _index: reviewer.reviewer_name,
+            )
 
         self.assertIs(current_main, main)
         self.assertEqual([item.reviewer_name for item in updated], ["replacement"])
+        prompt.assert_called_once()
 
     def test_run_reviewer_phase_with_death_handling_does_not_block_on_stale_reviewer(self):
         main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))

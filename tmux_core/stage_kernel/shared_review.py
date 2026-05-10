@@ -26,6 +26,11 @@ from tmux_core.runtime.tmux_runtime import (
     is_provider_runtime_error,
     is_worker_death_error,
 )
+from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_RECHECK,
+    AGENT_INTERVENTION_WORKER_DEAD,
+    request_worker_manual_intervention,
+)
 from T09_terminal_ops import (
     PROMPT_BACK_VALUE,
     PromptBackRequested,
@@ -50,8 +55,8 @@ DEFAULT_REVIEWER_COUNT = 1
 MAX_REVIEWER_REPAIR_ATTEMPTS = 2
 DEFAULT_STAGE_REVIEW_MAX_ROUNDS = 5
 REVIEWER_CONSECUTIVE_FAILURE_RECONFIG_THRESHOLD = 2
-AGENT_READY_TIMEOUT_RETRY = "retry_after_manual_model_change"
-AGENT_READY_TIMEOUT_SKIP = "kill_and_skip"
+AGENT_READY_TIMEOUT_RETRY = AGENT_INTERVENTION_RECHECK
+AGENT_READY_TIMEOUT_SKIP = AGENT_INTERVENTION_WORKER_DEAD
 
 
 @dataclass(frozen=True)
@@ -883,6 +888,8 @@ def prompt_agent_ready_timeout_recovery(
     can_skip: bool,
     progress: ReviewStageProgress | None = None,
     reason_text: str = "",
+    allow_recreate: bool = False,
+    target_paths: Sequence[str | Path] = (),
 ) -> str:
     role_text = str(role_label or "").strip() or "智能体"
     session_name = str(getattr(worker, "session_name", "") or "").strip()
@@ -890,29 +897,16 @@ def prompt_agent_ready_timeout_recovery(
         f"{session_name or role_text}启动超时，未能进入可输入状态。\n"
         "请先手动更换模型或处理该 AGENT，再选择恢复动作。"
     )
-    mark_worker_awaiting_reconfiguration(worker, reason_text=reason)
-    message(reason)
-    if progress is not None:
-        progress.set_phase(f"等待人工处理智能体启动超时 | {session_name or role_text}")
-    options: list[tuple[str, str]] = [
-        (AGENT_READY_TIMEOUT_RETRY, "我已手动更换模型，继续尝试"),
-    ]
-    if can_skip:
-        options.append((AGENT_READY_TIMEOUT_SKIP, "关闭这个 AGENT"))
-    with progress.suspended() if progress is not None else nullcontext():
-        return prompt_select_option(
-            title=f"HITL: 智能体启动超时 - {session_name or role_text}",
-            options=tuple(options),
-            default_value=AGENT_READY_TIMEOUT_RETRY,
-            prompt_text="请选择恢复方式",
-            is_hitl=True,
-            extra_payload={
-                "recovery_kind": "agent_ready_timeout",
-                "session_name": session_name,
-                "role_label": role_text,
-                "can_skip": bool(can_skip),
-            },
-        )
+    return request_worker_manual_intervention(
+        stage_label="智能体启动超时",
+        role_label=session_name or role_text,
+        worker=worker,
+        reason_text=reason,
+        target_paths=target_paths,
+        progress=progress,
+        allow_recreate=allow_recreate,
+        allow_worker_dead=can_skip,
+    )
 
 
 def ensure_empty_file(file_path: str | Path) -> Path:

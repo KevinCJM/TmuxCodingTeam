@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Sequence
@@ -71,6 +71,12 @@ from tmux_core.stage_kernel.stage_audit import (
     append_stage_audit_record,
     begin_stage_audit_run,
     record_before_cleanup,
+)
+from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_RECHECK,
+    AGENT_INTERVENTION_RECREATE,
+    AGENT_INTERVENTION_WORKER_DEAD,
+    request_worker_manual_intervention,
 )
 from tmux_core.stage_kernel.shared_review import (
     ReviewLimitHitlConfig,
@@ -1571,6 +1577,25 @@ def run_reviewer_turn_with_recreation(
                     if provider_runtime_error
                     else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
                 )
+                decision = request_worker_manual_intervention(
+                    stage_label="详细设计",
+                    role_label=reviewer_display_name,
+                    worker=current_reviewer.worker,
+                    reason_text=reason_text,
+                    target_paths=(current_reviewer.review_md_path, current_reviewer.review_json_path),
+                    progress=progress,
+                    allow_recreate=True,
+                    allow_worker_dead=True,
+                )
+                if decision == AGENT_INTERVENTION_RECHECK:
+                    continue
+                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                    with suppress(Exception):
+                        current_reviewer.worker.request_kill()
+                    message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                    return None
+                if decision != AGENT_INTERVENTION_RECREATE:
+                    continue
                 mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
                 replacement = recreate_reviewer_runtime(
                     project_dir=project_dir,
@@ -1582,10 +1607,30 @@ def run_reviewer_turn_with_recreation(
                     reason_text=reason_text,
                 )
                 if replacement is None:
-                    raise RuntimeError(f"{reviewer_display_name} 无法继续，且未能重建审核智能体") from error
+                    message(f"{reviewer_display_name} 重新创建失败，请重新选择恢复方式。")
+                    continue
                 current_reviewer = replacement
                 continue
             if is_worker_death_error(error):
+                decision = request_worker_manual_intervention(
+                    stage_label="详细设计",
+                    role_label=reviewer_display_name,
+                    worker=current_reviewer.worker,
+                    reason_text=f"{reviewer_display_name} 执行失败或已死亡。\n{str(error)}",
+                    target_paths=(current_reviewer.review_md_path, current_reviewer.review_json_path),
+                    progress=progress,
+                    allow_recreate=True,
+                    allow_worker_dead=True,
+                )
+                if decision == AGENT_INTERVENTION_RECHECK:
+                    continue
+                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                    with suppress(Exception):
+                        current_reviewer.worker.request_kill()
+                    message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                    return None
+                if decision != AGENT_INTERVENTION_RECREATE:
+                    continue
                 replacement = recreate_reviewer_runtime(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
@@ -1594,8 +1639,8 @@ def run_reviewer_turn_with_recreation(
                     progress=progress,
                 )
                 if replacement is None:
-                    message(f"{reviewer_display_name} 已死亡，用户选择不重建，当前阶段将忽略该审核智能体。")
-                    return None
+                    message(f"{reviewer_display_name} 重新创建失败，请重新选择恢复方式。")
+                    continue
                 current_reviewer = replacement
                 continue
             raise

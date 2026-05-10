@@ -32,6 +32,7 @@ from A06_TaskSplit import (
 )
 from tmux_core.runtime.contracts import TurnFileContract, TurnFileResult
 from tmux_core.stage_kernel.shared_review import ReviewerRuntime
+from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 from T08_pre_development import build_pre_development_task_record_path
 
 
@@ -1540,6 +1541,9 @@ class A06TaskSplitTests(unittest.TestCase):
             with patch(
                 "A06_TaskSplit.run_task_result_turn_with_repair",
                 side_effect=fake_run_task_result_turn_with_repair,
+            ), patch(
+                "A06_TaskSplit.request_worker_manual_intervention",
+                return_value=AGENT_INTERVENTION_RECREATE,
             ), patch(
                 "A06_TaskSplit.recreate_task_split_reviewer_runtime",
                 return_value=replacement,

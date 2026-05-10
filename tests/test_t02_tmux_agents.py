@@ -785,6 +785,130 @@ s
             with mock.patch.object(worker, "target_exists", return_value=True):
                 self.assertEqual(worker.get_agent_state(observation), AgentRuntimeState.STARTING)
 
+    def test_opencode_manual_launch_ready_surface_recovers_from_not_started(self):
+        class FakeOpenCodeConfig:
+            vendor = Vendor.OPENCODE
+            model = "opencode-go/deepseek-v4-pro"
+            reasoning_effort = "max"
+            proxy_url = ""
+
+            def build_launch_command(self, work_dir):
+                return f"opencode {work_dir} --pure --model {self.model}"
+
+            def expected_current_commands(self):
+                return ("opencode", "node")
+
+            def to_summary(self):
+                return {
+                    "vendor": "opencode",
+                    "model": self.model,
+                    "resolved_model": self.model,
+                    "reasoning_effort": self.reasoning_effort,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            work_dir = Path(tmp_dir)
+            worker = TmuxBatchWorker(
+                worker_id="opencode-manual-ready-worker",
+                work_dir=work_dir,
+                config=FakeOpenCodeConfig(),
+                runtime_root=work_dir / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = False
+            worker.agent_state = AgentRuntimeState.STARTING
+            observation = WorkerObservation(
+                visible_text='Ask anything... "Fix broken tests"\nBuild · DeepSeek V4 Pro OpenCode Go · max\nctrl+p commands',
+                raw_log_delta="",
+                raw_log_tail='Ask anything... "Fix broken tests"\nBuild · DeepSeek V4 Pro OpenCode Go · max\nctrl+p commands',
+                current_command="node",
+                current_path=str(work_dir),
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-05-10T12:30:00",
+                pane_title="OpenCode",
+            )
+
+            self.assertEqual(worker.get_agent_state(observation), AgentRuntimeState.READY)
+
+    def test_opencode_passive_health_captures_visible_ready_surface_when_not_started(self):
+        class FakeOpenCodeConfig:
+            vendor = Vendor.OPENCODE
+            model = "opencode-go/deepseek-v4-pro"
+            reasoning_effort = "max"
+            proxy_url = ""
+
+            def build_launch_command(self, work_dir):
+                return f"opencode {work_dir} --pure --model {self.model}"
+
+            def expected_current_commands(self):
+                return ("opencode", "node")
+
+            def to_summary(self):
+                return {
+                    "vendor": "opencode",
+                    "model": self.model,
+                    "resolved_model": self.model,
+                    "reasoning_effort": self.reasoning_effort,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            work_dir = Path(tmp_dir)
+            worker = TmuxBatchWorker(
+                worker_id="opencode-passive-ready-worker",
+                work_dir=work_dir,
+                config=FakeOpenCodeConfig(),
+                runtime_root=work_dir / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = False
+            worker.agent_state = AgentRuntimeState.STARTING
+            visible_capture_count = 0
+
+            def lightweight_observation():
+                return WorkerObservation(
+                    visible_text="",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="node",
+                    current_path=str(work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-10T12:30:00",
+                    pane_title="OpenCode",
+                )
+
+            def visible_observation(*, tail_lines=500):
+                nonlocal visible_capture_count
+                _ = tail_lines
+                visible_capture_count += 1
+                return WorkerObservation(
+                    visible_text='Ask anything... "Fix broken tests"\nBuild · DeepSeek V4 Pro OpenCode Go · max\nctrl+p commands',
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="node",
+                    current_path=str(work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-10T12:30:01",
+                    pane_title="OpenCode",
+                )
+
+            worker._capture_lightweight_observation = lightweight_observation  # noqa: SLF001
+            worker._capture_visible_observation_without_raw_log = visible_observation  # noqa: SLF001
+
+            snapshot = worker._refresh_health_state_nonintrusive(notify_on_change=False)  # noqa: SLF001
+            state = worker.read_state()
+
+        self.assertEqual(visible_capture_count, 1)
+        self.assertEqual(snapshot.agent_state, "READY")
+        self.assertTrue(worker.agent_started)
+        self.assertEqual(state["agent_state"], "READY")
+        self.assertTrue(state["agent_started"])
+
     def test_wrapper_state_maps_not_ready_and_ready(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             worker = TmuxBatchWorker(
@@ -2131,6 +2255,124 @@ workspace (/directory)                                                     branc
         self.assertEqual(worker.wait_calls, 2)
         self.assertTrue(any(note.startswith("still_running:") for _, note, _ in worker.state_notes))
 
+    def test_completion_contract_turn_skips_pre_submit_full_observation(self):
+        class CompletionContractWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts = []
+                self.observe_calls = 0
+                self.observe_calls_at_send = None
+
+            def _write_state(self, status, *, note, extra=None):
+                return None
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.pane_id = "%1"
+                self.agent_ready = True
+                self.agent_started = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "TmuxCodingTeam"
+
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                self.observe_calls += 1
+                return WorkerObservation(
+                    visible_text="",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-28T19:16:56",
+                    pane_title="TmuxCodingTeam",
+                )
+
+            def _send_text(self, text, enter_count=None):
+                self.observe_calls_at_send = self.observe_calls
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):
+                return WorkerObservation(
+                    visible_text=prompt,
+                    raw_log_delta=prompt,
+                    raw_log_tail=prompt,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-28T19:16:57",
+                    pane_title="⠋ TmuxCodingTeam",
+                )
+
+            def wait_for_turn_artifacts(self, *, contract, task_status_path=None, timeout_sec):
+                artifact_path.write_text("ok", encoding="utf-8")
+                contract.status_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "turn_id": contract.turn_id,
+                            "phase": contract.phase,
+                            "status": "done",
+                            "written_at": "2026-04-28T19:17:00+08:00",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                if task_status_path is not None:
+                    write_task_status(task_status_path, status="done")
+                self.current_task_runtime_status = "done"
+                return contract.validator(contract.status_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir).resolve()
+            contract_path = root / "review.json"
+            artifact_path = root / "review.md"
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload=payload,
+                    artifact_paths={"review_md": str(artifact_path)},
+                    artifact_hashes={"review_md": "sha256:md"},
+                    validated_at="2026-04-28T19:17:01",
+                )
+
+            worker = CompletionContractWorker(
+                worker_id="completion-contract-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=root / "runtime",
+            )
+            result = worker.run_turn(
+                label="development_review_init_M2-T14_测试工程师_round_1",
+                prompt="write review files only",
+                completion_contract=TurnFileContract(
+                    turn_id="development_review_M2-T14_测试工程师",
+                    phase="任务开发",
+                    status_path=contract_path,
+                    validator=validator,
+                    quiet_window_sec=0.0,
+                ),
+                timeout_sec=1.0,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertEqual(worker.observe_calls_at_send, 0)
+
     def test_run_turn_keeps_waiting_when_prompt_confirmation_times_out_but_codex_is_busy(self):
         class BusyAfterPromptTimeoutWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -3051,6 +3293,63 @@ workspace (/directory)                                                     branc
                         ),
                         task_status_path=task_status_path,
                         timeout_sec=1.0,
+                    )
+
+    def test_wait_for_turn_artifacts_does_not_stall_busy_alive_agent(self):
+        class BusyArtifactWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="working",
+                    raw_log_delta="",
+                    raw_log_tail="working",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-10T12:00:00",
+                    pane_title="⠏ DRL_PM",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            status_path = root / "review.json"
+            task_status_path = root / "task_runtime.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+
+            def validator(path: Path) -> TurnFileResult:
+                raise FileNotFoundError(path)
+
+            worker = BusyArtifactWorker(
+                worker_id="busy-artifact-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+            worker._last_terminal_change_monotonic = time.monotonic() - 60.0
+            worker.terminal_recently_changed = False
+
+            with mock.patch("T02_tmux_agents.TASK_CONTRACT_STALL_IDLE_SEC", 0.0), mock.patch(
+                "T02_tmux_agents.FILE_CONTRACT_POLL_INTERVAL_SEC",
+                0.01,
+            ):
+                with self.assertRaisesRegex(TimeoutError, "等待 turn 文件结果超时"):
+                    worker.wait_for_turn_artifacts(
+                        contract=TurnFileContract(
+                            turn_id="development_review_busy",
+                            phase="任务开发",
+                            status_path=status_path,
+                            validator=validator,
+                            quiet_window_sec=0.0,
+                        ),
+                        task_status_path=task_status_path,
+                        timeout_sec=0.05,
                     )
 
     def test_wait_for_turn_artifacts_raises_contract_violation_when_invalid_file_stalls_running_task(self):
@@ -8399,6 +8698,56 @@ Do you trust the files in this folder?
 
         self.assertIn(("set-option", "-g", "history-limit", "10000"), backend.run_calls)
         self.assertIn(("set-option", "-t", worker.session_name, "history-limit", "10000"), tmux_calls)
+
+    def test_create_session_writes_starting_state_without_sync_health_refresh(self):
+        class FakeBackend:
+            def __init__(self):
+                self.live_sessions: set[str] = set()
+
+            def list_sessions(self):
+                return list(self.live_sessions)
+
+            def has_session(self, session_name):
+                return session_name in self.live_sessions
+
+            def run(self, *args, **kwargs):  # noqa: ANN003
+                _ = args
+                _ = kwargs
+                return subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+            def create_session(self, session_name, work_dir, command):
+                _ = work_dir
+                _ = command
+                self.live_sessions.add(session_name)
+                return "%1"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="development-review-测试工程师",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                backend=FakeBackend(),
+                runtime_metadata={
+                    "project_dir": tmp_dir,
+                    "requirement_name": "需求A",
+                    "workflow_action": "stage.a07.start",
+                },
+            )
+            worker._start_pipe_logging = lambda: None
+            worker._ensure_health_supervisor_started = lambda: None
+            worker._refresh_health_state_nonintrusive = mock.Mock(side_effect=AssertionError("sync health refresh should not run"))
+
+            pane_id = worker.create_session()
+            state = worker.read_state()
+
+        self.assertEqual(pane_id, "%1")
+        self.assertEqual(state["status"], "ready")
+        self.assertEqual(state["note"], "session_created")
+        self.assertEqual(state["agent_state"], "STARTING")
+        self.assertEqual(state["health_status"], "alive")
+        self.assertEqual(state["workflow_action"], "stage.a07.start")
+        worker._refresh_health_state_nonintrusive.assert_not_called()
 
     def test_session_name_reservation_is_released_when_session_creation_fails(self):
         class FakeBackend:

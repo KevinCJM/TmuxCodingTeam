@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping, Sequence, TextIO
 
 from tmux_core.requirements_scope import resolve_requirement_name_from_prompt_response
 from tmux_core.runtime.tmux_runtime import (
+    RuntimeShutdownRequested,
     TmuxBatchWorker,
     TmuxRuntimeController,
     clear_runtime_shutdown_request,
@@ -145,7 +146,7 @@ class PromptBroker:
         prompt_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         with self._lock:
             if self._shutdown_reason:
-                raise RuntimeError(self._shutdown_reason)
+                raise RuntimeShutdownRequested(self._shutdown_reason)
             self._prompt_seq += 1
             prompt_id = f"prompt_{threading.get_ident()}_{self._prompt_seq}"
             self._pending[prompt_id] = prompt_queue
@@ -163,7 +164,7 @@ class PromptBroker:
             payload = prompt_queue.get()
             shutdown_reason = str(payload.get("__prompt_broker_shutdown__", "")).strip()
             if shutdown_reason:
-                raise RuntimeError(shutdown_reason)
+                raise RuntimeShutdownRequested(shutdown_reason)
             return payload
         finally:
             with self._lock:
@@ -487,6 +488,24 @@ def _write_project_stage_failure_record(
         return None
 
 
+def _clear_project_stage_failure_record(
+    *,
+    record_dir: Path,
+    action: str,
+) -> None:
+    action_text = str(action or "").strip()
+    if not action_text:
+        return
+    failure_path = record_dir / f"{_stage_record_action_fragment(action_text)}.failure.json"
+    with contextlib.suppress(Exception):
+        failure_path.unlink()
+    latest_path = record_dir / "latest_failure.json"
+    with contextlib.suppress(Exception):
+        payload = json.loads(latest_path.read_text(encoding="utf-8"))
+        if str(payload.get("action", "")).strip() == action_text:
+            latest_path.unlink()
+
+
 def _write_project_stage_state_record(
     *,
     project_dir: str,
@@ -514,6 +533,8 @@ def _write_project_stage_state_record(
             for stale_state_path in record_dir.glob("*.state.json"):
                 with contextlib.suppress(Exception):
                     stale_state_path.unlink()
+        if str(status or "").strip() in {"running", "awaiting-input"} and normalized_source != "runner_failure":
+            _clear_project_stage_failure_record(record_dir=record_dir, action=action_text)
         payload = {
             "action": action_text,
             "status": str(status or "").strip() or "ready",
