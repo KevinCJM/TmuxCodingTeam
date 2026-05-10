@@ -16,6 +16,8 @@ export type WorkerSnapshot = {
   agentState: string
   healthStatus: string
   currentTaskRuntimeStatus?: string
+  dispatchState?: string
+  dispatchReason?: string
   vendor?: string
   model?: string
   resolvedModel?: string

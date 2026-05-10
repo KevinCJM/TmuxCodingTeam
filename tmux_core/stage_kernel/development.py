@@ -56,6 +56,7 @@ from tmux_core.runtime.tmux_runtime import (
     build_session_name,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
+    is_runtime_shutdown_error,
     is_task_result_contract_error,
     is_worker_death_error,
     is_turn_artifact_contract_error,
@@ -175,6 +176,10 @@ MAX_DEVELOPER_METADATA_REPAIR_ATTEMPTS = 2
 DEFAULT_DEVELOPER_MAX_TURNS = 15
 REVIEWER_LATE_ARTIFACT_GRACE_SEC = 8.0
 REVIEWER_LATE_ARTIFACT_POLL_SEC = 0.2
+A07_REVIEWER_TURN_START_TIMEOUT_SEC = 8.0
+A07_REVIEWER_PROMPT_SUBMIT_TIMEOUT_SEC = 2.0
+A07_PRE_SUBMIT_OBSERVATION_TAIL_LINES = 160
+A07_PRE_SUBMIT_OBSERVATION_TAIL_BYTES = 12000
 PLACEHOLDER_NEXT_STEP = "下一步进入测试阶段（待接入）"
 
 DEFAULT_DEVELOPMENT_REVIEWER_PROMPTS: dict[str, str] = {
@@ -1270,6 +1275,10 @@ def _run_developer_result_turn(
                     if paths is not None else None
                 ),
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+                turn_start_timeout_sec=A07_REVIEWER_TURN_START_TIMEOUT_SEC,
+                prompt_submit_timeout_sec=A07_REVIEWER_PROMPT_SUBMIT_TIMEOUT_SEC,
+                pre_submit_observation_tail_lines=A07_PRE_SUBMIT_OBSERVATION_TAIL_LINES,
+                pre_submit_observation_tail_bytes=A07_PRE_SUBMIT_OBSERVATION_TAIL_BYTES,
                 stage_label="任务开发",
                 role_label=str(current_developer.worker.session_name or "开发工程师").strip() or "开发工程师",
                 task_name=task_name,
@@ -1657,6 +1666,133 @@ def _run_parallel_reviewer_initialization(
     )
 
 
+def prelaunch_development_reviewers(
+    reviewers: Sequence[ReviewerRuntime],
+    *,
+    progress: ReviewStageProgress | None = None,
+    timeout_sec: float = A07_REVIEWER_TURN_START_TIMEOUT_SEC,
+    notify: Callable[[str], None] | None = None,
+) -> list[ReviewerRuntime]:
+    reviewer_list = list(reviewers)
+    if not reviewer_list:
+        return reviewer_list
+    if progress is not None:
+        progress.set_phase("任务开发 / 预启动审核器")
+
+    def prelaunch(reviewer: ReviewerRuntime) -> ReviewerRuntime:
+        ensure_ready = getattr(reviewer.worker, "ensure_agent_ready", None)
+        if callable(ensure_ready):
+            ensure_ready(timeout_sec=timeout_sec)
+        return reviewer
+
+    with ThreadPoolExecutor(max_workers=max(1, len(reviewer_list))) as executor:
+        future_map = {executor.submit(prelaunch, reviewer): reviewer for reviewer in reviewer_list}
+        for future in as_completed(future_map):
+            reviewer = future_map[future]
+            try:
+                future.result()
+            except Exception as error:  # noqa: BLE001
+                if is_runtime_shutdown_error(error):
+                    raise
+                log_event = getattr(reviewer.worker, "_log_event", None)
+                if callable(log_event):
+                    event_name = (
+                        "reviewer_prelaunch_ready_timeout"
+                        if is_agent_ready_timeout_error(error)
+                        else "reviewer_prelaunch_failed"
+                    )
+                    log_event(
+                        event_name,
+                        reviewer_name=reviewer.reviewer_name,
+                        session_name=str(reviewer.worker.session_name or ""),
+                        timeout_sec=timeout_sec,
+                        error=str(error),
+                    )
+                if notify is not None:
+                    notify(
+                        f"{_development_reviewer_display_name(reviewer)} 预启动暂未就绪，"
+                        f"timeout={timeout_sec}s，将在审核器初始化时继续恢复: {error}"
+                    )
+    return reviewer_list
+
+
+def initialize_developer_with_parallel_reviewer_prelaunch(
+    developer: DeveloperRuntime,
+    *,
+    paths: dict[str, Path],
+    reviewers: Sequence[ReviewerRuntime],
+    reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
+    project_dir: str | Path = ".",
+    requirement_name: str = "",
+    progress: ReviewStageProgress | None = None,
+    turn_policy: DeveloperTurnPolicy | None = None,
+    replace_dead_developer=None,
+    replace_dead_developer_for_init=None,
+    audit_context: StageAuditRunContext | None = None,
+    notify: Callable[[str], None] | None = None,
+) -> tuple[DeveloperRuntime, list[ReviewerRuntime]]:
+    reviewer_list = list(reviewers)
+    if not reviewer_list:
+        return initialize_development_workers(
+            developer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            paths=paths,
+            reviewers=(),
+            reviewer_specs_by_name=reviewer_specs_by_name,
+            initialize_developer=True,
+            initialize_reviewers=False,
+            progress=progress,
+            turn_policy=turn_policy,
+            replace_dead_developer=replace_dead_developer,
+            replace_dead_developer_for_init=replace_dead_developer_for_init,
+            audit_context=audit_context,
+        )
+
+    results: dict[str, object] = {}
+    errors: dict[str, Exception] = {}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_map = {
+            executor.submit(
+                initialize_development_workers,
+                developer,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                paths=paths,
+                reviewers=(),
+                reviewer_specs_by_name=reviewer_specs_by_name,
+                initialize_developer=True,
+                initialize_reviewers=False,
+                progress=progress,
+                turn_policy=turn_policy,
+                replace_dead_developer=replace_dead_developer,
+                replace_dead_developer_for_init=replace_dead_developer_for_init,
+                audit_context=audit_context,
+            ): "developer_init",
+            executor.submit(
+                prelaunch_development_reviewers,
+                reviewer_list,
+                progress=None,
+                timeout_sec=A07_REVIEWER_TURN_START_TIMEOUT_SEC,
+                notify=notify,
+            ): "reviewer_prelaunch",
+        }
+        for future in as_completed(future_map):
+            branch = future_map[future]
+            try:
+                results[branch] = future.result()
+            except Exception as error:  # noqa: BLE001
+                errors[branch] = error
+    if errors:
+        if len(errors) == 1:
+            raise next(iter(errors.values()))
+        summary = "\n".join(f"{branch}: {error}" for branch, error in errors.items())
+        raise RuntimeError(f"开发工程师初始化与审核器预启动并行执行失败:\n{summary}")
+    current_developer, _ = results["developer_init"]  # type: ignore[misc]
+    prelaunched_reviewers = results.get("reviewer_prelaunch", reviewer_list)
+    return current_developer, list(prelaunched_reviewers)  # type: ignore[arg-type]
+
+
 def _development_reviewer_display_name(reviewer: ReviewerRuntime) -> str:
     return str(reviewer.worker.session_name or reviewer.reviewer_name).strip() or reviewer.reviewer_name
 
@@ -1753,6 +1889,10 @@ def _run_single_reviewer_initialization(
                 parse_result_payload=lambda text: _parse_result_payload(text) if str(text).strip() else {},
                 turn_goal=_build_developer_turn_goal(paths, init_contract),
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+                turn_start_timeout_sec=A07_REVIEWER_TURN_START_TIMEOUT_SEC,
+                prompt_submit_timeout_sec=A07_REVIEWER_PROMPT_SUBMIT_TIMEOUT_SEC,
+                pre_submit_observation_tail_lines=A07_PRE_SUBMIT_OBSERVATION_TAIL_LINES,
+                pre_submit_observation_tail_bytes=A07_PRE_SUBMIT_OBSERVATION_TAIL_BYTES,
                 stage_label="任务开发",
                 role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
             )
@@ -2419,6 +2559,8 @@ def run_reviewer_turn_with_recreation(
                 ),
                 turn_goal=_build_reviewer_turn_goal(),
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+                turn_start_timeout_sec=A07_REVIEWER_TURN_START_TIMEOUT_SEC,
+                prompt_submit_timeout_sec=A07_REVIEWER_PROMPT_SUBMIT_TIMEOUT_SEC,
                 stage_label="任务开发",
                 role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
                 task_name=task_name,
@@ -3621,20 +3763,27 @@ def run_development_stage(
                 progress=progress,
                 can_skip_ready_timeout=len(reviewer_workers) > 1,
             )
-        reviewers_built = False
+        reviewer_workers = build_reviewer_workers(
+            args,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            reviewer_specs=reviewer_specs,
+            reviewer_selections_by_name=reviewer_selections_by_name,
+            progress=progress,
+            launch_coordinator=launch_coordinator,
+        )
+        reviewers_built = True
         reviewers_initialized = False
-        _, reviewer_workers, developer = run_main_phase_with_death_handling(
+        init_result, _, developer = run_main_phase_with_death_handling(
             developer,
             reviewers=(),
-            run_phase=lambda current_developer: initialize_development_workers(
+            run_phase=lambda current_developer: initialize_developer_with_parallel_reviewer_prelaunch(
                 current_developer,
                 project_dir=project_dir,
                 requirement_name=requirement_name,
                 paths=paths,
-                reviewers=(),
+                reviewers=reviewer_workers,
                 reviewer_specs_by_name=reviewer_specs_by_name,
-                initialize_developer=True,
-                initialize_reviewers=False,
                 progress=progress,
                 turn_policy=developer_turn_policy,
                 replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
@@ -3657,12 +3806,15 @@ def run_development_stage(
                     error=error,
                 ),
                 audit_context=audit_context,
-            )[0],
+                notify=message,
+            ),
+            owner_getter=lambda result: result[0],
             replace_dead_main_owner=replace_dead_developer_owner,
             main_label="开发工程师",
             reviewer_label_getter=reviewer_label_getter,
             notify=message,
         )
+        developer, reviewer_workers = init_result
         review_round_policy = ReviewRoundPolicy(review_round_limit)
 
         while next_task is not None:

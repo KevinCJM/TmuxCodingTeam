@@ -1317,6 +1317,8 @@ def _read_worker_state_snapshot(
         "turn_status_path": str(state.get("current_turn_status_path", "")).strip(),
         "current_turn_phase": str(state.get("current_turn_phase", "")).strip(),
         "current_task_runtime_status": current_task_runtime_status,
+        "dispatch_state": str(state.get("dispatch_state", "")).strip(),
+        "dispatch_reason": str(state.get("dispatch_reason", "")).strip(),
         "question_path": str(turn_bundle.get("question_path") or "").strip(),
         "answer_path": str(turn_bundle.get("answer_path") or "").strip(),
         "artifact_paths": artifact_paths,
@@ -1388,6 +1390,9 @@ class BridgeCore:
         self._snapshot_dirty_lock = threading.Lock()
         self._snapshot_dirty_sections: set[str] = set()
         self._snapshot_dirty_stage_routes: set[str] = set()
+        self._snapshot_dirty_refresh_worker_health = False
+        self._snapshot_dirty_update_display_stage = False
+        self._snapshot_refresh_worker_health = True
         self._snapshot_debounce_timer: threading.Timer | None = None
         self._artifact_index_lock = threading.Lock()
         self._artifact_index_scope: tuple[str, str] = ("", "")
@@ -1677,10 +1682,11 @@ class BridgeCore:
         )
 
     def _handle_runtime_state_change(self) -> None:
-        self._emit_display_stage_state()
         self._schedule_snapshot_update(
             sections={"app", "control", "hitl"},
             stage_routes=self._stage_routes_for_action(self._display_action or self._context.current_action),
+            refresh_worker_health=False,
+            update_display_stage=True,
         )
 
     def _active_stage_runner_alive(self, action: str) -> bool:
@@ -2026,10 +2032,11 @@ class BridgeCore:
             action=resolved_action,
         )
 
-    def _scan_runtime_workers(self, runtime_root: str | Path) -> list[dict[str, Any]]:
+    def _scan_runtime_workers(self, runtime_root: str | Path, *, refresh_health: bool | None = None) -> list[dict[str, Any]]:
         root = Path(runtime_root).expanduser().resolve()
         if not root.exists() or not root.is_dir():
             return []
+        should_refresh_health = self._snapshot_refresh_worker_health if refresh_health is None else bool(refresh_health)
         workers: list[dict[str, Any]] = []
         for state_path in sorted(root.glob("**/worker.state.json")):
             try:
@@ -2037,7 +2044,15 @@ class BridgeCore:
                     continue
             except ValueError:
                 pass
-            snapshot = self._refresh_running_worker_snapshot_if_needed(state_path)
+            if should_refresh_health:
+                snapshot = self._refresh_running_worker_snapshot_if_needed(state_path)
+            else:
+                snapshot = _read_worker_state_snapshot(
+                    state_path,
+                    session_exists_resolver=self._tmux_runtime.session_exists,
+                    session_context_resolver=self._session_context_resolver(),
+                    state_identity_resolver=self._state_identity_resolver(),
+                )
             if snapshot:
                 workers.append(snapshot)
         return workers
@@ -2151,7 +2166,8 @@ class BridgeCore:
                 "transition_text": "",
             }
         center = session.center
-        center.refresh_worker_health()
+        if self._snapshot_refresh_worker_health:
+            center.refresh_worker_health()
         if center.all_done() and session.final_result is None:
             session.final_result = center.wait_until_complete()
             session.transition_text = center.transition_to_requirements_phase(session.final_result)
@@ -3342,7 +3358,10 @@ class BridgeCore:
         include_artifacts: bool = False,
         stage_routes: Sequence[str] | None = None,
         include_all_stages: bool = False,
+        refresh_worker_health: bool = True,
     ) -> None:
+        previous_refresh_worker_health = self._snapshot_refresh_worker_health
+        self._snapshot_refresh_worker_health = bool(refresh_worker_health)
         selected_routes = tuple(route for route, _builder in STAGE_SNAPSHOT_BUILDERS) if include_all_stages else tuple(stage_routes or ())
         stage_snapshots: dict[str, dict[str, Any]] = {}
         control_snapshot: dict[str, Any] | None = None
@@ -3351,91 +3370,94 @@ class BridgeCore:
         artifacts_snapshot: dict[str, Any] | None = None
         runs: list[Mapping[str, Any]] | None = None
 
-        if selected_routes:
-            def _build_stages() -> Mapping[str, Any]:
-                nonlocal stage_snapshots
-                if not stage_snapshots:
-                    stage_snapshots = self._build_stage_snapshots(selected_routes)
-                return stage_snapshots
+        try:
+            if selected_routes:
+                def _build_stages() -> Mapping[str, Any]:
+                    nonlocal stage_snapshots
+                    if not stage_snapshots:
+                        stage_snapshots = self._build_stage_snapshots(selected_routes)
+                    return stage_snapshots
 
-            try:
-                stage_snapshots = dict(_build_stages())
-            except Exception as error:  # noqa: BLE001
-                self._emit_log_error(
-                    title="snapshot emit failed",
-                    error=error,
-                    traceback_text=traceback.format_exc(),
-                )
-                stage_snapshots = {}
+                try:
+                    stage_snapshots = dict(_build_stages())
+                except Exception as error:  # noqa: BLE001
+                    self._emit_log_error(
+                        title="snapshot emit failed",
+                        error=error,
+                        traceback_text=traceback.format_exc(),
+                    )
+                    stage_snapshots = {}
 
-        if include_control or include_app or include_artifacts:
-            try:
-                control_snapshot = self._build_control_snapshot_for_session(self._current_control_session())
-            except Exception as error:  # noqa: BLE001
-                self._emit_log_error(
-                    title="snapshot emit failed",
-                    error=error,
-                    traceback_text=traceback.format_exc(),
-                )
-                control_snapshot = {}
-        if include_hitl or include_app:
-            try:
-                hitl_snapshot = self._build_hitl_snapshot()
-            except Exception as error:  # noqa: BLE001
-                self._emit_log_error(
-                    title="snapshot emit failed",
-                    error=error,
-                    traceback_text=traceback.format_exc(),
-                )
-                hitl_snapshot = {}
-        if include_app:
-            try:
-                attention_snapshot = self._attention_manager.snapshot()
-                runs = self._list_runs()
-            except Exception as error:  # noqa: BLE001
-                self._emit_log_error(
-                    title="snapshot emit failed",
-                    error=error,
-                    traceback_text=traceback.format_exc(),
-                )
-                attention_snapshot = {}
-                runs = []
-        if include_artifacts or include_app:
-            try:
-                artifacts_snapshot = self._build_artifacts_snapshot(
-                    stages=stage_snapshots,
-                    control=control_snapshot or {},
-                )
-            except Exception as error:  # noqa: BLE001
-                self._emit_log_error(
-                    title="snapshot emit failed",
-                    error=error,
-                    traceback_text=traceback.format_exc(),
-                )
-                artifacts_snapshot = {"items": []}
+            if include_control or include_app or include_artifacts:
+                try:
+                    control_snapshot = self._build_control_snapshot_for_session(self._current_control_session())
+                except Exception as error:  # noqa: BLE001
+                    self._emit_log_error(
+                        title="snapshot emit failed",
+                        error=error,
+                        traceback_text=traceback.format_exc(),
+                    )
+                    control_snapshot = {}
+            if include_hitl or include_app:
+                try:
+                    hitl_snapshot = self._build_hitl_snapshot()
+                except Exception as error:  # noqa: BLE001
+                    self._emit_log_error(
+                        title="snapshot emit failed",
+                        error=error,
+                        traceback_text=traceback.format_exc(),
+                    )
+                    hitl_snapshot = {}
+            if include_app:
+                try:
+                    attention_snapshot = self._attention_manager.snapshot()
+                    runs = self._list_runs()
+                except Exception as error:  # noqa: BLE001
+                    self._emit_log_error(
+                        title="snapshot emit failed",
+                        error=error,
+                        traceback_text=traceback.format_exc(),
+                    )
+                    attention_snapshot = {}
+                    runs = []
+            if include_artifacts or include_app:
+                try:
+                    artifacts_snapshot = self._build_artifacts_snapshot(
+                        stages=stage_snapshots,
+                        control=control_snapshot or {},
+                    )
+                except Exception as error:  # noqa: BLE001
+                    self._emit_log_error(
+                        title="snapshot emit failed",
+                        error=error,
+                        traceback_text=traceback.format_exc(),
+                    )
+                    artifacts_snapshot = {"items": []}
 
-        if include_app:
-            self._emit_snapshot_payload(
-                "snapshot.app",
-                lambda: self._build_app_snapshot(
-                    runs=runs or [],
-                    control=control_snapshot or {},
-                    hitl=hitl_snapshot or {},
-                    attention=attention_snapshot or {},
-                    artifacts=artifacts_snapshot or {"items": []},
-                ),
-            )
-        for route in selected_routes:
-            snapshot = stage_snapshots.get(route)
-            if snapshot is None:
-                continue
-            self.emit_event("snapshot.stage", {"route": route, "snapshot": snapshot})
-        if include_control:
-            self.emit_event("snapshot.control", control_snapshot or {})
-        if include_hitl:
-            self.emit_event("snapshot.hitl", hitl_snapshot or {"pending": False})
-        if include_artifacts:
-            self.emit_event("snapshot.artifacts", artifacts_snapshot or {"items": []})
+            if include_app:
+                self._emit_snapshot_payload(
+                    "snapshot.app",
+                    lambda: self._build_app_snapshot(
+                        runs=runs or [],
+                        control=control_snapshot or {},
+                        hitl=hitl_snapshot or {},
+                        attention=attention_snapshot or {},
+                        artifacts=artifacts_snapshot or {"items": []},
+                    ),
+                )
+            for route in selected_routes:
+                snapshot = stage_snapshots.get(route)
+                if snapshot is None:
+                    continue
+                self.emit_event("snapshot.stage", {"route": route, "snapshot": snapshot})
+            if include_control:
+                self.emit_event("snapshot.control", control_snapshot or {})
+            if include_hitl:
+                self.emit_event("snapshot.hitl", hitl_snapshot or {"pending": False})
+            if include_artifacts:
+                self.emit_event("snapshot.artifacts", artifacts_snapshot or {"items": []})
+        finally:
+            self._snapshot_refresh_worker_health = previous_refresh_worker_health
 
     def _emit_all_snapshots(self) -> None:
         self._emit_snapshot_update(
@@ -3452,6 +3474,8 @@ class BridgeCore:
         sections: set[str],
         stage_routes: Sequence[str] | None = None,
         delay_sec: float | None = None,
+        refresh_worker_health: bool = True,
+        update_display_stage: bool = False,
     ) -> None:
         normalized_sections = {str(item).strip() for item in sections if str(item).strip()}
         normalized_routes = {str(item).strip() for item in (stage_routes or ()) if str(item).strip()}
@@ -3460,6 +3484,12 @@ class BridgeCore:
         with self._snapshot_dirty_lock:
             self._snapshot_dirty_sections.update(normalized_sections)
             self._snapshot_dirty_stage_routes.update(normalized_routes)
+            self._snapshot_dirty_refresh_worker_health = (
+                self._snapshot_dirty_refresh_worker_health or bool(refresh_worker_health)
+            )
+            self._snapshot_dirty_update_display_stage = (
+                self._snapshot_dirty_update_display_stage or bool(update_display_stage)
+            )
             if self._snapshot_debounce_timer is not None:
                 return
             timer = threading.Timer(
@@ -3474,15 +3504,27 @@ class BridgeCore:
         with self._snapshot_dirty_lock:
             sections = set(self._snapshot_dirty_sections)
             stage_routes = set(self._snapshot_dirty_stage_routes)
+            refresh_worker_health = self._snapshot_dirty_refresh_worker_health
+            update_display_stage = self._snapshot_dirty_update_display_stage
             self._snapshot_dirty_sections.clear()
             self._snapshot_dirty_stage_routes.clear()
+            self._snapshot_dirty_refresh_worker_health = False
+            self._snapshot_dirty_update_display_stage = False
             self._snapshot_debounce_timer = None
+        if update_display_stage:
+            previous_refresh_worker_health = self._snapshot_refresh_worker_health
+            self._snapshot_refresh_worker_health = bool(refresh_worker_health)
+            try:
+                self._emit_display_stage_state()
+            finally:
+                self._snapshot_refresh_worker_health = previous_refresh_worker_health
         self._emit_snapshot_update(
             include_app="app" in sections,
             include_control="control" in sections,
             include_hitl="hitl" in sections,
             include_artifacts="artifacts" in sections,
             stage_routes=tuple(sorted(stage_routes)),
+            refresh_worker_health=refresh_worker_health,
         )
 
     @staticmethod
@@ -4150,6 +4192,8 @@ class BridgeCore:
                 self._snapshot_debounce_timer = None
                 self._snapshot_dirty_sections.clear()
                 self._snapshot_dirty_stage_routes.clear()
+                self._snapshot_dirty_refresh_worker_health = False
+                self._snapshot_dirty_update_display_stage = False
             if timer is not None:
                 timer.cancel()
             self._prompt_broker.shutdown()

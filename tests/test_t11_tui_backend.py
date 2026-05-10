@@ -1498,6 +1498,7 @@ class T11TuiBackendTests(unittest.TestCase):
 
             with patch("tmux_core.bridge.backend.load_worker_from_state_path", return_value=None):
                 server._bridge_ui.notify_runtime_state_changed()  # noqa: SLF001
+                server._flush_dirty_snapshots()  # noqa: SLF001
                 messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
 
             stage_events = [item for item in messages if item.get("kind") == "event" and item.get("type") == "stage.changed"]
@@ -2739,6 +2740,7 @@ class T11TuiBackendTests(unittest.TestCase):
             server._display_status = "completed"  # noqa: SLF001
 
             server._bridge_ui.notify_runtime_state_changed()  # noqa: SLF001
+            server._flush_dirty_snapshots()  # noqa: SLF001
             messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
 
         stage_events = [item for item in messages if item.get("kind") == "event" and item.get("type") == "stage.changed"]
@@ -4011,6 +4013,88 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(workers[0]["session_name"], "sess-runtime")
         self.assertTrue(workers[0]["session_exists"])
 
+    def test_runtime_worker_lightweight_scan_skips_health_refresh(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            worker_root = runtime_root / "worker-1"
+            worker_root.mkdir(parents=True)
+            (worker_root / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "session_name": "sess-runtime",
+                        "work_dir": "/tmp/project",
+                        "status": "running",
+                        "agent_state": "BUSY",
+                        "health_status": "alive",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime = SimpleNamespace(session_exists=lambda name: name == "sess-runtime", backend=object())  # noqa: SLF001
+            with patch("T11_tui_backend.load_worker_from_state_path") as load_worker:
+                workers = server._scan_runtime_workers(runtime_root, refresh_health=False)  # noqa: SLF001
+
+        load_worker.assert_not_called()
+        self.assertEqual(workers[0]["session_name"], "sess-runtime")
+
+    def test_handle_runtime_state_change_schedules_lightweight_snapshot_without_stage_inference(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        server._display_action = "stage.a07.start"  # noqa: SLF001
+        with patch.object(server, "_infer_runtime_stage_status", side_effect=AssertionError("stage inference should be async")) as infer_status, patch.object(
+            server,
+            "_schedule_snapshot_update",
+        ) as schedule_snapshot:
+            server._handle_runtime_state_change()  # noqa: SLF001
+
+        schedule_snapshot.assert_called_once()
+        infer_status.assert_not_called()
+        self.assertFalse(schedule_snapshot.call_args.kwargs["refresh_worker_health"])
+
+    def test_runtime_triggered_lightweight_snapshot_includes_dispatch_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            requirement_name = "需求A"
+            worker_root = project_dir / DEVELOPMENT_RUNTIME_ROOT_NAME / requirement_name / "worker-1"
+            worker_root.mkdir(parents=True)
+            (worker_root / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "worker_id": "development-review-测试工程师",
+                        "session_name": "测试工程师-天慧星",
+                        "work_dir": str(project_dir),
+                        "project_dir": str(project_dir),
+                        "requirement_name": requirement_name,
+                        "workflow_action": "stage.a07.start",
+                        "status": "running",
+                        "agent_state": "READY",
+                        "health_status": "alive",
+                        "dispatch_state": "submitting",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime = SimpleNamespace(session_exists=lambda name: name == "测试工程师-天慧星", backend=object())  # noqa: SLF001
+            server._context.project_dir = str(project_dir)  # noqa: SLF001
+            server._context.requirement_name = requirement_name  # noqa: SLF001
+            emitted: list[tuple[str, dict[str, object]]] = []
+            with patch.object(server, "emit_event", side_effect=lambda event, payload: emitted.append((event, payload))), patch(
+                "T11_tui_backend.load_worker_from_state_path"
+            ) as load_worker:
+                server._emit_snapshot_update(  # noqa: SLF001
+                    stage_routes=("development",),
+                    refresh_worker_health=False,
+                )
+
+        load_worker.assert_not_called()
+        stage_events = [payload for event, payload in emitted if event == "snapshot.stage"]
+        self.assertEqual(stage_events[0]["route"], "development")
+        workers = stage_events[0]["snapshot"]["workers"]  # type: ignore[index]
+        self.assertEqual(workers[0]["dispatch_state"], "submitting")
+
     def test_development_snapshot_recovers_sparse_health_state_from_tmux_identity(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
@@ -4642,6 +4726,7 @@ class T11TuiBackendTests(unittest.TestCase):
             server._display_status = "completed"  # noqa: SLF001
 
             server._bridge_ui.notify_runtime_state_changed()  # noqa: SLF001
+            server._flush_dirty_snapshots()  # noqa: SLF001
             messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
 
         stage_events = [item for item in messages if item.get("kind") == "event" and item.get("type") == "stage.changed"]

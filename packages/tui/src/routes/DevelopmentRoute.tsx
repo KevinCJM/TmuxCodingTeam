@@ -45,7 +45,13 @@ export function DevelopmentRoute(props: Props) {
         <text>Workers</text>
         <Show when={props.snapshot.workers.length > 0} fallback={<text fg="#888888">当前没有任务开发 workers。</text>}>
           <For each={props.snapshot.workers}>
-            {(worker) => <text>{`${worker.sessionName} | ${worker.workflowStage}/${worker.agentState} | ${worker.healthStatus}`}</text>}
+            {(worker) => {
+              const dispatch = () => worker.dispatchState ? ` | dispatch:${worker.dispatchState}` : ''
+              const reason = () => worker.dispatchReason ? ` (${worker.dispatchReason})` : ''
+              return (
+                <text>{`${worker.sessionName} | ${worker.workflowStage}/${worker.agentState} | ${worker.healthStatus}${dispatch()}${reason()}`}</text>
+              )
+            }}
           </For>
         </Show>
       </box>

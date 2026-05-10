@@ -118,7 +118,7 @@ export class BackendClient {
         // Process is already gone.
       }
     }, Math.max(0, forceKillAfterMs))
-    const stopPromise = Promise.resolve(exited).catch(() => undefined).finally(() => {
+    const stopPromise: Promise<void> = Promise.resolve(exited).then(() => undefined, () => undefined).finally(() => {
       if (timer) clearTimeout(timer)
       if (this.stoppingProcess === child) this.stoppingProcess = undefined
       if (this.stoppingPromise === stopPromise) this.stoppingPromise = undefined

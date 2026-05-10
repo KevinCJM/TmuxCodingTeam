@@ -304,6 +304,10 @@ def run_task_result_turn_with_repair(
     parse_result_payload: Callable[[str], dict[str, object]],
     turn_goal: TaskTurnGoal | None = None,
     timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
+    turn_start_timeout_sec: float | None = None,
+    prompt_submit_timeout_sec: float | None = None,
+    pre_submit_observation_tail_lines: int | None = None,
+    pre_submit_observation_tail_bytes: int | None = None,
     stage_label: str = "",
     role_label: str = "",
     task_name: str = "",
@@ -323,12 +327,21 @@ def run_task_result_turn_with_repair(
             if repair_attempt == 0 or repair_result_contract is None
             else repair_result_contract
         )
-        result = worker.run_turn(
-            label=current_label,
-            prompt=current_prompt,
-            result_contract=active_result_contract,
-            timeout_sec=timeout_sec,
-        )
+        run_turn_kwargs: dict[str, object] = {
+            "label": current_label,
+            "prompt": current_prompt,
+            "result_contract": active_result_contract,
+            "timeout_sec": timeout_sec,
+        }
+        if turn_start_timeout_sec is not None:
+            run_turn_kwargs["turn_start_timeout_sec"] = turn_start_timeout_sec
+        if prompt_submit_timeout_sec is not None:
+            run_turn_kwargs["prompt_submit_timeout_sec"] = prompt_submit_timeout_sec
+        if pre_submit_observation_tail_lines is not None:
+            run_turn_kwargs["pre_submit_observation_tail_lines"] = pre_submit_observation_tail_lines
+        if pre_submit_observation_tail_bytes is not None:
+            run_turn_kwargs["pre_submit_observation_tail_bytes"] = pre_submit_observation_tail_bytes
+        result = worker.run_turn(**run_turn_kwargs)
         current_error: RuntimeError | None = None
         payload: dict[str, object] | None = None
         if result.ok:
@@ -436,6 +449,10 @@ def run_completion_turn_with_repair(
     completion_contract: TurnFileContract,
     turn_goal: CompletionTurnGoal | None = None,
     timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
+    turn_start_timeout_sec: float | None = None,
+    prompt_submit_timeout_sec: float | None = None,
+    pre_submit_observation_tail_lines: int | None = None,
+    pre_submit_observation_tail_bytes: int | None = None,
     stage_label: str = "",
     role_label: str = "",
     task_name: str = "",
@@ -460,12 +477,21 @@ def run_completion_turn_with_repair(
             )
             if validation.valid and not observation.last_validation_error:
                 return
-        result = worker.run_turn(
-            label=current_label,
-            prompt=current_prompt,
-            completion_contract=completion_contract,
-            timeout_sec=timeout_sec,
-        )
+        run_turn_kwargs: dict[str, object] = {
+            "label": current_label,
+            "prompt": current_prompt,
+            "completion_contract": completion_contract,
+            "timeout_sec": timeout_sec,
+        }
+        if turn_start_timeout_sec is not None:
+            run_turn_kwargs["turn_start_timeout_sec"] = turn_start_timeout_sec
+        if prompt_submit_timeout_sec is not None:
+            run_turn_kwargs["prompt_submit_timeout_sec"] = prompt_submit_timeout_sec
+        if pre_submit_observation_tail_lines is not None:
+            run_turn_kwargs["pre_submit_observation_tail_lines"] = pre_submit_observation_tail_lines
+        if pre_submit_observation_tail_bytes is not None:
+            run_turn_kwargs["pre_submit_observation_tail_bytes"] = pre_submit_observation_tail_bytes
+        result = worker.run_turn(**run_turn_kwargs)
         current_error = RuntimeError(result.clean_output or f"{current_label} 执行失败") if not result.ok else None
         observation = observe_completion_state(completion_contract)
         validation = (

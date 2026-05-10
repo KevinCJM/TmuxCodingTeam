@@ -674,6 +674,8 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
     agentState: String(value.agent_state ?? value.agentState ?? ''),
     healthStatus: String(value.health_status ?? value.healthStatus ?? ''),
     currentTaskRuntimeStatus: String(value.current_task_runtime_status ?? value.currentTaskRuntimeStatus ?? ''),
+    dispatchState: String(value.dispatch_state ?? value.dispatchState ?? ''),
+    dispatchReason: String(value.dispatch_reason ?? value.dispatchReason ?? ''),
     vendor: String(value.vendor ?? ''),
     model: String(value.model ?? ''),
     resolvedModel: String(value.resolved_model ?? value.resolvedModel ?? ''),

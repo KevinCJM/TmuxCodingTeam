@@ -129,6 +129,11 @@ SHELL_COMMANDS = {"bash", "fish", "sh", "zsh"}
 BRAILLE_SPINNER_CHARS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 CLAUDE_READY_TITLE = "✳ Claude Code"
 CLAUDE_BUSY_TITLE_CHARS = f"{BRAILLE_SPINNER_CHARS}⠐⠂·✶✻✽✢"
+_RUNTIME_STATE_NOTIFY_DEBOUNCE_SEC = 0.15
+_runtime_state_notify_lock = threading.Lock()
+_runtime_state_notify_timer: threading.Timer | None = None
+_runtime_state_notify_pending = False
+_runtime_state_notify_running = False
 
 
 def _truthy_runtime_flag(value: object) -> bool:
@@ -1346,15 +1351,55 @@ def _worker_role_label(role_key: str) -> str:
     return "执行者"
 
 
-def _notify_runtime_state_changed_best_effort() -> None:
+def _flush_runtime_state_changed_notification() -> None:
+    global _runtime_state_notify_pending, _runtime_state_notify_running, _runtime_state_notify_timer
+    with _runtime_state_notify_lock:
+        if not _runtime_state_notify_pending:
+            _runtime_state_notify_timer = None
+            return
+        if _runtime_state_notify_running:
+            _runtime_state_notify_timer = None
+            return
+        _runtime_state_notify_pending = False
+        _runtime_state_notify_timer = None
+        _runtime_state_notify_running = True
     try:
         from T09_terminal_ops import notify_runtime_state_changed
     except Exception:
-        return
-    try:
-        notify_runtime_state_changed()
-    except Exception:
-        return
+        pass
+    else:
+        try:
+            notify_runtime_state_changed()
+        except Exception:
+            pass
+    finally:
+        with _runtime_state_notify_lock:
+            _runtime_state_notify_running = False
+            should_reschedule = _runtime_state_notify_pending and _runtime_state_notify_timer is None
+            if not should_reschedule:
+                return
+            timer = threading.Timer(
+                max(float(_RUNTIME_STATE_NOTIFY_DEBOUNCE_SEC), 0.0),
+                _flush_runtime_state_changed_notification,
+            )
+            timer.daemon = True
+            _runtime_state_notify_timer = timer
+            timer.start()
+
+
+def _notify_runtime_state_changed_best_effort() -> None:
+    global _runtime_state_notify_pending, _runtime_state_notify_timer
+    with _runtime_state_notify_lock:
+        _runtime_state_notify_pending = True
+        if _runtime_state_notify_timer is not None or _runtime_state_notify_running:
+            return
+        timer = threading.Timer(
+            max(float(_RUNTIME_STATE_NOTIFY_DEBOUNCE_SEC), 0.0),
+            _flush_runtime_state_changed_notification,
+        )
+        timer.daemon = True
+        _runtime_state_notify_timer = timer
+        timer.start()
 
 
 def _preferred_constellation_index(work_dir: str | Path, role_key: str) -> int:
@@ -2088,13 +2133,11 @@ def classify_agent_runtime_state(
     if not _agent_command_running(current_command, context.expected_current_commands):
         return AgentRuntimeState.DEAD
     if not context.agent_started:
-        if context.title_ready:
-            return AgentRuntimeState.READY
-        if context.title_busy:
-            return AgentRuntimeState.BUSY
+        surface = "\n".join(
+            part for part in (observation.visible_text, observation.raw_log_tail) if str(part or "").strip()
+        )
         if context.vendor == Vendor.OPENCODE and (
-                str(observation.visible_text or "").strip()
-                or str(observation.raw_log_tail or "").strip()
+                re.search(r"\bBuild\s*·", _normalize_opencode_surface(surface), re.IGNORECASE)
         ):
             surface_state = _classify_opencode_surface_state(
                 visible_text=observation.visible_text,
@@ -2332,6 +2375,8 @@ class TmuxBatchWorker:
         self.current_task_status_path = ""
         self.current_task_result_path = ""
         self.current_task_runtime_status = ""
+        self.dispatch_state = ""
+        self.dispatch_reason = ""
         self._runtime_metadata: dict[str, object] = {
             key: value
             for key, value in dict(runtime_metadata or {}).items()
@@ -2361,6 +2406,8 @@ class TmuxBatchWorker:
             self.current_task_status_path = str(existing_state.get("current_task_status_path", ""))
             self.current_task_result_path = str(existing_state.get("current_task_result_path", ""))
             self.current_task_runtime_status = str(existing_state.get("current_task_runtime_status", ""))
+            self.dispatch_state = str(existing_state.get("dispatch_state", ""))
+            self.dispatch_reason = str(existing_state.get("dispatch_reason", ""))
             self.last_terminal_signature = str(existing_state.get("last_terminal_signature", ""))
             self.last_terminal_changed_at = str(existing_state.get("last_terminal_changed_at", ""))
             self.terminal_recently_changed = bool(existing_state.get("terminal_recently_changed", False))
@@ -2899,6 +2946,8 @@ class TmuxBatchWorker:
                 "current_task_status_path": self.current_task_status_path or str(previous.get("current_task_status_path", "")),
                 "current_task_result_path": self.current_task_result_path or str(previous.get("current_task_result_path", "")),
                 "current_task_runtime_status": self.current_task_runtime_status or str(previous.get("current_task_runtime_status", "")),
+                "dispatch_state": self.dispatch_state or str(previous.get("dispatch_state", "")),
+                "dispatch_reason": self.dispatch_reason or str(previous.get("dispatch_reason", "")),
                 "last_terminal_signature": self.last_terminal_signature,
                 "last_terminal_changed_at": self.last_terminal_changed_at,
                 "terminal_recently_changed": self.terminal_recently_changed,
@@ -2963,6 +3012,8 @@ class TmuxBatchWorker:
                 "current_task_status_path": self.current_task_status_path or str(previous.get("current_task_status_path", "")),
                 "current_task_result_path": self.current_task_result_path or str(previous.get("current_task_result_path", "")),
                 "current_task_runtime_status": current_task_runtime_status,
+                "dispatch_state": self.dispatch_state or str(previous.get("dispatch_state", "")),
+                "dispatch_reason": self.dispatch_reason or str(previous.get("dispatch_reason", "")),
                 "last_terminal_signature": self.last_terminal_signature,
                 "last_terminal_changed_at": self.last_terminal_changed_at,
                 "terminal_recently_changed": self.terminal_recently_changed,
@@ -3048,7 +3099,15 @@ class TmuxBatchWorker:
                 pane_id=self.pane_id,
                 session_name=self.session_name,
             )
-        agent_state = self.get_agent_state(passive_observation)
+        if (
+                self.current_task_runtime_status == TASK_STATUS_RUNNING
+                and self.dispatch_state == "submitted"
+                and self.agent_started
+                and self.is_agent_alive(passive_observation)
+        ):
+            agent_state = AgentRuntimeState.BUSY
+        else:
+            agent_state = self.get_agent_state(passive_observation)
         self.agent_state = agent_state
         if agent_state in {AgentRuntimeState.READY, AgentRuntimeState.BUSY}:
             self.agent_started = True
@@ -3158,8 +3217,14 @@ class TmuxBatchWorker:
 
     def _record_result(self, result: CommandResult, *, status: WorkerStatus, note: str,
                        extra: dict[str, object] | None = None) -> None:
+        extra_payload = dict(extra or {})
+        if status == WorkerStatus.SUCCEEDED:
+            self.dispatch_state = ""
+            self.dispatch_reason = ""
+            extra_payload.setdefault("dispatch_state", "")
+            extra_payload.setdefault("dispatch_reason", "")
         self.results.append(result)
-        self._write_state(status, note=note, extra=extra)
+        self._write_state(status, note=note, extra=extra_payload)
         self._append_transcript(f"{result.label} / output", f"```text\n{result.clean_output}\n```")
 
     def send_special_key(self, key: str) -> None:
@@ -4473,11 +4538,11 @@ class TmuxBatchWorker:
             return False, 0.0
         if observation.current_command in SHELL_COMMANDS or not self._agent_running(observation.current_command):
             return False, 0.0
+        if output_exists and invalid_output_stable_sec >= TASK_CONTRACT_STALL_IDLE_SEC:
+            return True, invalid_output_stable_sec
         agent_state = self.get_agent_state(observation)
         if agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}:
             return False, self._terminal_idle_elapsed_sec()
-        if output_exists and invalid_output_stable_sec >= TASK_CONTRACT_STALL_IDLE_SEC:
-            return True, invalid_output_stable_sec
         idle_elapsed = self._terminal_idle_elapsed_sec()
         if idle_elapsed < TASK_CONTRACT_STALL_IDLE_SEC:
             return False, idle_elapsed
@@ -4828,6 +4893,48 @@ class TmuxBatchWorker:
             extra=extra,
         )
 
+    def _mark_turn_submitted_busy(
+            self,
+            *,
+            label: str,
+            started_at: str,
+            task_status_path: Path,
+            result_path: Path,
+            attempt: int,
+            completion_contract: TurnFileContract | None,
+    ) -> None:
+        self.dispatch_state = "submitted"
+        self.dispatch_reason = ""
+        self.agent_ready = False
+        self.agent_started = True
+        self.agent_state = AgentRuntimeState.BUSY
+        self.wrapper_state = WrapperState.NOT_READY
+        self.current_task_runtime_status = TASK_STATUS_RUNNING
+        self._write_state(
+            WorkerStatus.RUNNING,
+            note=f"submitted:{label}",
+            extra={
+                "label": label,
+                "started_at": started_at,
+                "phase": "submitted",
+                "agent_ready": False,
+                "agent_started": True,
+                "agent_state": AgentRuntimeState.BUSY.value,
+                "current_command": self.current_command,
+                "current_path": self.current_path,
+                "current_turn_id": completion_contract.turn_id if completion_contract else "",
+                "current_turn_phase": completion_contract.phase if completion_contract else "",
+                "current_turn_status_path": str(completion_contract.status_path) if completion_contract else "",
+                "current_task_status_path": str(task_status_path),
+                "current_task_result_path": str(result_path) if self.current_task_result_path else "",
+                "current_task_runtime_status": TASK_STATUS_RUNNING,
+                "dispatch_state": self.dispatch_state,
+                "dispatch_reason": self.dispatch_reason,
+                "result_status": "running",
+                "retry_count": attempt - 1,
+            },
+        )
+
     def _wait_for_agent_ready(self, timeout_sec: float = 60.0) -> None:
         deadline = time.monotonic() + timeout_sec
         previous_ready_signature = ""
@@ -5037,13 +5144,38 @@ class TmuxBatchWorker:
             timeout_sec: float,
             previous_task_runtime_status: str = "",
             previous_worker_status: str = "",
+            initial_timeout_sec: float | None = None,
+            label: str = "",
     ) -> None:
+        ready_timeout = initial_timeout_sec if initial_timeout_sec is not None else 60.0
+        self._log_event("ready_wait_start", label=label, timeout_sec=ready_timeout)
         try:
-            self.ensure_agent_ready()
+            if initial_timeout_sec is None:
+                self.ensure_agent_ready()
+            else:
+                self.ensure_agent_ready(timeout_sec=initial_timeout_sec)
+            self._log_event("ready_wait_done", label=label, delayed=False)
             return
         except Exception as error:
             if not is_agent_ready_timeout_error(error):
                 raise
+            self.dispatch_state = "delayed"
+            self.dispatch_reason = f"ready_wait_timeout:{error}"
+            self._write_state(
+                WorkerStatus.RUNNING,
+                note=f"dispatch_delayed:{label}" if label else "dispatch_delayed",
+                extra={
+                    "dispatch_state": self.dispatch_state,
+                    "dispatch_reason": self.dispatch_reason,
+                    "dispatch_timeout_sec": ready_timeout,
+                },
+            )
+            self._log_event(
+                "ready_wait_delayed",
+                label=label,
+                timeout_sec=ready_timeout,
+                error=str(error),
+            )
             current_error = error
         while True:
             raise_if_runtime_shutdown_requested("waiting for busy agent before turn start")
@@ -5062,6 +5194,7 @@ class TmuxBatchWorker:
                 self._restart_stale_busy_agent_for_turn_start(timeout_sec=timeout_sec, reason=stale_reason)
             try:
                 self.ensure_agent_ready(timeout_sec=timeout_sec)
+                self._log_event("ready_wait_done", label=label, delayed=True)
                 return
             except Exception as error:
                 if not is_agent_ready_timeout_error(error):
@@ -5383,6 +5516,10 @@ class TmuxBatchWorker:
             completion_contract: TurnFileContract | None = None,
             result_contract: TaskResultContract | None = None,
             timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
+            turn_start_timeout_sec: float | None = None,
+            prompt_submit_timeout_sec: float | None = None,
+            pre_submit_observation_tail_lines: int | None = None,
+            pre_submit_observation_tail_bytes: int | None = None,
     ) -> CommandResult:
         raise_if_runtime_shutdown_requested(f"starting turn {label}")
         started_at = _now_iso()
@@ -5400,6 +5537,8 @@ class TmuxBatchWorker:
             self.current_task_status_path = str(task_status_path)
             self.current_task_result_path = str(result_path) if result_contract is not None else ""
             self.current_task_runtime_status = TASK_STATUS_RUNNING
+            self.dispatch_state = "preparing"
+            self.dispatch_reason = ""
             prompt_submission_observed = False
             submitted_prompt = self._build_turn_prompt(
                 prompt,
@@ -5424,9 +5563,18 @@ class TmuxBatchWorker:
                     "current_task_status_path": str(task_status_path),
                     "current_task_result_path": self.current_task_result_path,
                     "current_task_runtime_status": TASK_STATUS_RUNNING,
+                    "dispatch_state": self.dispatch_state,
+                    "dispatch_reason": self.dispatch_reason,
                     "result_status": "running",
                     "retry_count": attempt - 1,
                 },
+            )
+            self._log_event(
+                "dispatch_start",
+                label=label,
+                attempt=attempt,
+                turn_start_timeout_sec=turn_start_timeout_sec,
+                prompt_submit_timeout_sec=prompt_submit_timeout_sec,
             )
 
             try:
@@ -5434,6 +5582,8 @@ class TmuxBatchWorker:
                     timeout_sec=timeout_sec,
                     previous_task_runtime_status=previous_task_runtime_status,
                     previous_worker_status=previous_worker_status,
+                    initial_timeout_sec=turn_start_timeout_sec,
+                    label=label,
                 )
                 raise_if_runtime_shutdown_requested(f"submitting turn {label}")
                 needs_pre_submit_observation = (
@@ -5445,10 +5595,39 @@ class TmuxBatchWorker:
                 baseline_raw_log_tail = ""
                 baseline_reply = self.last_reply
                 if needs_pre_submit_observation:
-                    baseline_observation = self.observe(tail_lines=DEFAULT_CAPTURE_TAIL_LINES)
+                    observe_tail_lines = (
+                        DEFAULT_CAPTURE_TAIL_LINES
+                        if pre_submit_observation_tail_lines is None
+                        else max(int(pre_submit_observation_tail_lines), 1)
+                    )
+                    observe_tail_bytes = (
+                        24000
+                        if pre_submit_observation_tail_bytes is None
+                        else max(int(pre_submit_observation_tail_bytes), 1)
+                    )
+                    observe_started_monotonic = time.monotonic()
+                    self._log_event(
+                        "pre_submit_observe_start",
+                        label=label,
+                        tail_lines=observe_tail_lines,
+                        tail_bytes=observe_tail_bytes,
+                    )
+                    baseline_observation = self.observe(
+                        tail_lines=observe_tail_lines,
+                        tail_bytes=observe_tail_bytes,
+                    )
+                    self._log_event(
+                        "pre_submit_observe_done",
+                        label=label,
+                        tail_lines=observe_tail_lines,
+                        tail_bytes=observe_tail_bytes,
+                        elapsed_ms=round((time.monotonic() - observe_started_monotonic) * 1000, 3),
+                    )
                     baseline_visible = baseline_observation.visible_text
                     baseline_raw_log_tail = baseline_observation.raw_log_tail
                     baseline_reply = self.last_reply
+                self.dispatch_state = "submitting"
+                self.dispatch_reason = ""
                 self._write_state(
                     WorkerStatus.RUNNING,
                     note=f"turn:{label}",
@@ -5461,12 +5640,44 @@ class TmuxBatchWorker:
                         "current_task_status_path": str(task_status_path),
                         "current_task_result_path": self.current_task_result_path,
                         "current_task_runtime_status": TASK_STATUS_RUNNING,
+                        "dispatch_state": self.dispatch_state,
+                        "dispatch_reason": self.dispatch_reason,
                         "retry_count": attempt - 1,
                     },
                 )
+                self._log_event("send_text_start", label=label, size=len(submitted_prompt))
                 self._send_text(submitted_prompt)
+                self._log_event("send_text_done", label=label, size=len(submitted_prompt))
+                self._mark_turn_submitted_busy(
+                    label=label,
+                    started_at=started_at,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    attempt=attempt,
+                    completion_contract=completion_contract,
+                )
+                prompt_confirmation_timeout = min(
+                    timeout_sec,
+                    prompt_submit_timeout_sec if prompt_submit_timeout_sec is not None else 20.0,
+                )
                 if completion_contract is not None:
-                    self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=min(timeout_sec, 20.0))
+                    try:
+                        self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
+                        self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
+                    except TimeoutError as error:
+                        self.dispatch_state = "delayed"
+                        self.dispatch_reason = f"prompt_confirm_timeout:{error}"
+                        self._write_state(
+                            WorkerStatus.RUNNING,
+                            note=f"dispatch_delayed:{label}",
+                            extra={
+                                "dispatch_state": self.dispatch_state,
+                                "dispatch_reason": self.dispatch_reason,
+                                "dispatch_timeout_sec": prompt_confirmation_timeout,
+                            },
+                        )
+                        self._log_event("prompt_confirm_timeout", label=label, timeout_sec=prompt_confirmation_timeout)
+                        raise error
                     prompt_submission_observed = True
                     file_result = self.wait_for_turn_artifacts(
                         contract=completion_contract,
@@ -5495,7 +5706,23 @@ class TmuxBatchWorker:
                             baseline_observation=baseline_observation,
                         )
                     else:
-                        self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=min(timeout_sec, 20.0))
+                        try:
+                            self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
+                            self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
+                        except TimeoutError as error:
+                            self.dispatch_state = "delayed"
+                            self.dispatch_reason = f"prompt_confirm_timeout:{error}"
+                            self._write_state(
+                                WorkerStatus.RUNNING,
+                                note=f"dispatch_delayed:{label}",
+                                extra={
+                                    "dispatch_state": self.dispatch_state,
+                                    "dispatch_reason": self.dispatch_reason,
+                                    "dispatch_timeout_sec": prompt_confirmation_timeout,
+                                },
+                            )
+                            self._log_event("prompt_confirm_timeout", label=label, timeout_sec=prompt_confirmation_timeout)
+                            raise error
                         prompt_submission_observed = True
                         task_result = self.wait_for_task_result(
                             contract=result_contract,
@@ -5519,6 +5746,9 @@ class TmuxBatchWorker:
                 self.current_task_runtime_status = read_task_status(task_status_path)
                 self.agent_ready = True
                 self.agent_started = True
+                self.agent_state = AgentRuntimeState.READY
+                self.dispatch_state = ""
+                self.dispatch_reason = ""
                 self.wrapper_state = (
                     WrapperState.READY
                     if self._title_indicates_ready(self.last_pane_title)
@@ -5547,6 +5777,8 @@ class TmuxBatchWorker:
                         "current_task_status_path": str(task_status_path),
                         "current_task_result_path": self.current_task_result_path,
                         "current_task_runtime_status": self.current_task_runtime_status,
+                        "dispatch_state": self.dispatch_state,
+                        "dispatch_reason": self.dispatch_reason,
                     },
                 )
                 return result

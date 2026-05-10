@@ -32,11 +32,13 @@ class _FakeTaskWorker:
         self._responses = list(responses)
         self.prompts: list[str] = []
         self.result_contracts: list[TaskResultContract | None] = []
+        self.run_turn_kwargs: list[dict[str, object]] = []
         self.current_task_result_path = ""
 
-    def run_turn(self, *, label, prompt, result_contract=None, completion_contract=None, timeout_sec):  # noqa: ANN001, ARG002
+    def run_turn(self, *, label, prompt, result_contract=None, completion_contract=None, timeout_sec, **kwargs):  # noqa: ANN001, ARG002
         self.prompts.append(prompt)
         self.result_contracts.append(result_contract)
+        self.run_turn_kwargs.append(dict(kwargs))
         response = self._responses.pop(0)
         return response(result_contract=result_contract, completion_contract=completion_contract)
 
@@ -113,6 +115,59 @@ class TurnOutputGoalsTests(unittest.TestCase):
             self.assertNotIn("_result.json", worker.prompts[1])
             self.assertNotIn("task_runtime", worker.prompts[1])
             self.assertNotIn(".development_runtime", worker.prompts[1])
+
+    def test_run_task_result_turn_with_repair_forwards_pre_submit_observation_budget(self):
+        contract = TaskResultContract(
+            turn_id="turn-pre-submit",
+            phase="turn-pre-submit",
+            task_kind="turn-pre-submit",
+            mode="turn-pre-submit",
+            expected_statuses=("completed",),
+        )
+        worker = _FakeTaskWorker(
+            [lambda **_kwargs: SimpleNamespace(ok=True, clean_output=json.dumps({"status": "completed"}))]
+        )
+
+        payload = run_task_result_turn_with_repair(
+            worker=worker,
+            label="pre_submit_budget",
+            prompt="prompt",
+            result_contract=contract,
+            parse_result_payload=json.loads,
+            pre_submit_observation_tail_lines=160,
+            pre_submit_observation_tail_bytes=12000,
+        )
+
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(worker.run_turn_kwargs[0]["pre_submit_observation_tail_lines"], 160)
+        self.assertEqual(worker.run_turn_kwargs[0]["pre_submit_observation_tail_bytes"], 12000)
+
+    def test_run_completion_turn_with_repair_forwards_pre_submit_observation_budget(self):
+        contract = TurnFileContract(
+            turn_id="completion-pre-submit",
+            phase="completion-pre-submit",
+            status_path=Path("/tmp/completion-pre-submit.json"),
+            validator=lambda path: TurnFileResult(
+                status_path=str(path),
+                payload={},
+                artifact_paths={},
+                artifact_hashes={},
+                validated_at="2026-05-10T00:00:00",
+            ),
+        )
+        worker = _FakeTaskWorker([lambda **_kwargs: SimpleNamespace(ok=True, clean_output="")])
+
+        run_completion_turn_with_repair(
+            worker=worker,
+            label="completion_pre_submit_budget",
+            prompt="prompt",
+            completion_contract=contract,
+            pre_submit_observation_tail_lines=160,
+            pre_submit_observation_tail_bytes=12000,
+        )
+
+        self.assertEqual(worker.run_turn_kwargs[0]["pre_submit_observation_tail_lines"], 160)
+        self.assertEqual(worker.run_turn_kwargs[0]["pre_submit_observation_tail_bytes"], 12000)
 
     def test_run_task_result_turn_with_repair_does_not_ask_agent_to_write_internal_result_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

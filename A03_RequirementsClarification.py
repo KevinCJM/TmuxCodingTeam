@@ -737,6 +737,7 @@ def collect_request(args: argparse.Namespace) -> tuple[str, str]:
         requirement_name = str(args.requirement_name).strip()
     else:
         requirement_name = prompt_requirement_name_selection(project_dir, "").requirement_name
+    clear_requirements_human_exchange_file(project_dir, requirement_name)
     return project_dir, requirement_name
 
 

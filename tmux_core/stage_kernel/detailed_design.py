@@ -1612,6 +1612,19 @@ def run_reviewer_turn_with_recreation(
                 current_reviewer = replacement
                 continue
             if is_worker_death_error(error):
+                if not stdin_is_interactive():
+                    replacement = recreate_reviewer_runtime(
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        reviewer=current_reviewer,
+                        reviewer_spec=reviewer_spec,
+                        progress=progress,
+                    )
+                    if replacement is None:
+                        message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                        return None
+                    current_reviewer = replacement
+                    continue
                 decision = request_worker_manual_intervention(
                     stage_label="详细设计",
                     role_label=reviewer_display_name,

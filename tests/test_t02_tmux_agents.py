@@ -4,12 +4,14 @@ import io
 import json
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
+import T02_tmux_agents as runtime_module
 from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor, get_model_choices
 from T02_tmux_agents import (
     AgentRuntimeState,
@@ -50,7 +52,7 @@ from T02_tmux_agents import (
     TERMINAL_ACTIVITY_IDLE_WINDOW_SEC,
     _session_name_lease_lock,
 )
-from tmux_core.runtime.contracts import finalize_task_result, write_task_status
+from tmux_core.runtime.contracts import TASK_STATUS_DONE, TaskResultFile, finalize_task_result, write_task_status
 from tmux_core.runtime.tmux_runtime import (
     is_worker_death_error,
     worker_state_has_launch_evidence,
@@ -8384,6 +8386,43 @@ Do you trust the files in this folder?
             )
             self.assertEqual(busy.agent_state, AgentRuntimeState.BUSY.value)
 
+            worker.agent_state = AgentRuntimeState.READY
+            worker.current_task_runtime_status = "running"
+            worker.dispatch_state = "preparing"
+            running_turn = worker._build_passive_health_snapshot(  # noqa: SLF001
+                WorkerObservation(
+                    visible_text="",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="codex",
+                    current_path=tmp_dir,
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-24T00:00:01",
+                    pane_title="TmuxCodingTeam",
+                )
+            )
+            self.assertEqual(running_turn.agent_state, AgentRuntimeState.READY.value)
+            worker.dispatch_state = "submitted"
+            submitted_turn = worker._build_passive_health_snapshot(  # noqa: SLF001
+                WorkerObservation(
+                    visible_text="",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="codex",
+                    current_path=tmp_dir,
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-24T00:00:02",
+                    pane_title="TmuxCodingTeam",
+                )
+            )
+            self.assertEqual(submitted_turn.agent_state, AgentRuntimeState.BUSY.value)
+            worker.current_task_runtime_status = ""
+            worker.dispatch_state = ""
+
             dead = worker._build_passive_health_snapshot(  # noqa: SLF001
                 WorkerObservation(
                     visible_text="",
@@ -8514,6 +8553,360 @@ Do you trust the files in this folder?
         self.assertEqual(LaunchCoordinator.current_stagger(Vendor.GEMINI), 8.0)
         LaunchCoordinator.record_launch_result(Vendor.GEMINI, success=True)
         self.assertEqual(LaunchCoordinator.current_stagger(Vendor.GEMINI), 2.0)
+
+    def test_run_turn_marks_agent_busy_after_prompt_submission(self):
+        class BusyAfterSubmitWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.mid_turn_state = {}
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ANN001, ARG002
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "codex"
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                return None
+
+            def _wait_for_turn_reply(self, **kwargs):
+                self.mid_turn_state = self.read_state()
+                write_task_status(kwargs["task_status_path"], status=TASK_STATUS_DONE)
+                return "ok"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = BusyAfterSubmitWorker(
+                worker_id="busy-after-submit",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_ready = True
+            worker.agent_state = AgentRuntimeState.READY
+            worker.current_command = "codex"
+
+            result = worker.run_turn(label="busy_case", prompt="hello", timeout_sec=0.05)
+            final_state = worker.read_state()
+
+        self.assertTrue(result.ok)
+        self.assertEqual(worker.mid_turn_state["status"], WorkerStatus.RUNNING.value)
+        self.assertEqual(worker.mid_turn_state["agent_state"], AgentRuntimeState.BUSY.value)
+        self.assertFalse(worker.mid_turn_state["agent_ready"])
+        self.assertEqual(worker.mid_turn_state["current_task_runtime_status"], "running")
+        self.assertEqual(worker.mid_turn_state["dispatch_state"], "submitted")
+        self.assertEqual(final_state["agent_state"], AgentRuntimeState.READY.value)
+
+    def test_run_turn_fast_dispatch_uses_explicit_initial_ready_timeout(self):
+        class FastDispatchWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.ensure_timeouts = []
+                self.sent_prompts = []
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ANN001
+                self.ensure_timeouts.append(timeout_sec)
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "TmuxCodingTeam"
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_prompts.append(text)
+                write_task_status(self.current_task_status_path, status=TASK_STATUS_DONE)
+
+            def _wait_for_turn_reply(self, **kwargs):
+                return "ok"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = FastDispatchWorker(
+                worker_id="fast-dispatch",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+
+            result = worker.run_turn(
+                label="fast_dispatch",
+                prompt="hello",
+                timeout_sec=2.0,
+                turn_start_timeout_sec=8.0,
+                prompt_submit_timeout_sec=2.0,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(worker.ensure_timeouts, [8.0])
+        self.assertEqual(len(worker.sent_prompts), 1)
+
+    def test_run_turn_result_contract_uses_default_pre_submit_observation_budget(self):
+        class ResultContractWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_calls = []
+
+            def _write_state(self, status, *, note, extra=None):  # noqa: ANN001, ARG002
+                return None
+
+            def _append_transcript(self, title, body):  # noqa: ANN001, ARG002
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.pane_id = "%1"
+                self.agent_ready = True
+                self.agent_started = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "TmuxCodingTeam"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                self.observe_calls.append((tail_lines, tail_bytes))
+                return WorkerObservation(
+                    visible_text="baseline",
+                    raw_log_delta="",
+                    raw_log_tail="tail",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-10T00:00:00",
+                )
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                write_task_status(self.current_task_status_path, status=TASK_STATUS_DONE)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):  # noqa: ANN001, ARG002
+                return None
+
+            def wait_for_task_result(self, **kwargs):  # noqa: ANN001
+                return TaskResultFile(
+                    result_path=str(kwargs["result_path"]),
+                    payload={"status": "completed"},
+                    artifact_paths={},
+                    artifact_hashes={},
+                    validated_at="2026-05-10T00:00:01",
+                )
+
+        contract = TaskResultContract(
+            turn_id="result-default-observe",
+            phase="result-default-observe",
+            task_kind="result-default-observe",
+            mode="result-default-observe",
+            expected_statuses=("completed",),
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = ResultContractWorker(
+                worker_id="result-default-observe",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            result = worker.run_turn(
+                label="result_default_observe",
+                prompt="hello",
+                result_contract=contract,
+                timeout_sec=2.0,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(worker.observe_calls[:1], [(runtime_module.DEFAULT_CAPTURE_TAIL_LINES, 24000)])
+
+    def test_run_turn_result_contract_fast_pre_submit_observation_reaches_send_text_quickly(self):
+        class FastObservationWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_calls = []
+                self.sent_prompts = []
+                self.events = []
+
+            def _write_state(self, status, *, note, extra=None):  # noqa: ANN001, ARG002
+                return None
+
+            def _append_transcript(self, title, body):  # noqa: ANN001, ARG002
+                return None
+
+            def _log_event(self, event, **payload):  # noqa: ANN001
+                self.events.append((event, payload))
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.pane_id = "%1"
+                self.agent_ready = True
+                self.agent_started = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "TmuxCodingTeam"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                self.observe_calls.append((tail_lines, tail_bytes))
+                if tail_lines >= runtime_module.DEFAULT_CAPTURE_TAIL_LINES:
+                    time.sleep(1.0)
+                return WorkerObservation(
+                    visible_text="baseline",
+                    raw_log_delta="",
+                    raw_log_tail="tail",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-10T00:00:00",
+                )
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_prompts.append(text)
+                write_task_status(self.current_task_status_path, status=TASK_STATUS_DONE)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):  # noqa: ANN001, ARG002
+                return None
+
+            def wait_for_task_result(self, **kwargs):  # noqa: ANN001
+                return TaskResultFile(
+                    result_path=str(kwargs["result_path"]),
+                    payload={"status": "completed"},
+                    artifact_paths={},
+                    artifact_hashes={},
+                    validated_at="2026-05-10T00:00:01",
+                )
+
+        contract = TaskResultContract(
+            turn_id="result-fast-observe",
+            phase="result-fast-observe",
+            task_kind="result-fast-observe",
+            mode="result-fast-observe",
+            expected_statuses=("completed",),
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = FastObservationWorker(
+                worker_id="result-fast-observe",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            started = time.monotonic()
+            result = worker.run_turn(
+                label="result_fast_observe",
+                prompt="hello",
+                result_contract=contract,
+                timeout_sec=2.0,
+                pre_submit_observation_tail_lines=160,
+                pre_submit_observation_tail_bytes=12000,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertTrue(result.ok)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(worker.observe_calls[:1], [(160, 12000)])
+        self.assertEqual(len(worker.sent_prompts), 1)
+        event_names = [event for event, _payload in worker.events]
+        self.assertIn("pre_submit_observe_start", event_names)
+        self.assertIn("pre_submit_observe_done", event_names)
+
+    def test_run_turn_send_text_is_not_blocked_by_slow_runtime_state_notification(self):
+        class FastDispatchWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts = []
+
+            def is_agent_alive(self, observation=None):  # noqa: ANN001, ARG002
+                return True
+
+            def get_agent_state(self, observation=None):  # noqa: ANN001, ARG002
+                return AgentRuntimeState.READY
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "TmuxCodingTeam"
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_prompts.append(text)
+                write_task_status(self.current_task_status_path, status=TASK_STATUS_DONE)
+
+            def _wait_for_turn_reply(self, **kwargs):  # noqa: ARG002
+                return "ok"
+
+        notify_started = threading.Event()
+        release_notify = threading.Event()
+
+        def slow_notify() -> None:
+            notify_started.set()
+            release_notify.wait(timeout=2.0)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = FastDispatchWorker(
+                worker_id="fast-dispatch-slow-notify",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            with mock.patch("T09_terminal_ops.notify_runtime_state_changed", side_effect=slow_notify), mock.patch.object(
+                runtime_module,
+                "_RUNTIME_STATE_NOTIFY_DEBOUNCE_SEC",
+                0.0,
+            ):
+                started = time.monotonic()
+                result = worker.run_turn(
+                    label="fast_dispatch_slow_notify",
+                    prompt="hello",
+                    timeout_sec=2.0,
+                    turn_start_timeout_sec=8.0,
+                    prompt_submit_timeout_sec=2.0,
+                )
+                elapsed = time.monotonic() - started
+                notified = notify_started.wait(timeout=1.0)
+                release_notify.set()
+                time.sleep(0.05)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(notified)
+
+    def test_runtime_state_notification_debounces_downstream_calls(self):
+        notify_called = threading.Event()
+        calls = {"count": 0}
+
+        def record_notify() -> None:
+            calls["count"] += 1
+            notify_called.set()
+
+        with mock.patch("T09_terminal_ops.notify_runtime_state_changed", side_effect=record_notify), mock.patch.object(
+            runtime_module,
+            "_RUNTIME_STATE_NOTIFY_DEBOUNCE_SEC",
+            0.02,
+        ):
+            runtime_module._notify_runtime_state_changed_best_effort()  # noqa: SLF001
+            runtime_module._notify_runtime_state_changed_best_effort()  # noqa: SLF001
+            runtime_module._notify_runtime_state_changed_best_effort()  # noqa: SLF001
+            self.assertTrue(notify_called.wait(timeout=1.0))
+            time.sleep(0.05)
+
+        self.assertEqual(calls["count"], 1)
 
     def test_run_turn_retries_once_after_timeout(self):
         class RetryOnceWorker(TmuxBatchWorker):

@@ -9,6 +9,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from A07_Development import (
+    A07_PRE_SUBMIT_OBSERVATION_TAIL_BYTES,
+    A07_PRE_SUBMIT_OBSERVATION_TAIL_LINES,
+    A07_REVIEWER_PROMPT_SUBMIT_TIMEOUT_SEC,
+    A07_REVIEWER_TURN_START_TIMEOUT_SEC,
     DevelopmentReviewerSpec,
     DevelopmentStageResult,
     DeveloperPlan,
@@ -18,8 +22,11 @@ from A07_Development import (
     _build_reviewer_turn_goal,
     _shutdown_workers as shutdown_development_workers,
     _run_developer_result_turn,
+    _run_parallel_reviewers,
     _run_single_reviewer_initialization,
     _replace_dead_developer_with_bootstrap,
+    initialize_developer_with_parallel_reviewer_prelaunch,
+    prelaunch_development_reviewers,
     build_reviewer_completion_contract,
     build_developer_review_feedback_result_contract,
     build_developer_init_prompt,
@@ -651,6 +658,129 @@ class A07DevelopmentTests(unittest.TestCase):
         prompt_recovery.assert_called_once()
         recreate_runtime.assert_not_called()
 
+    def test_single_reviewer_initialization_uses_fast_dispatch_budget(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                reviewer_key="测试工程师",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+                worker=_LiveReadyWorker(session_name="测试工程师-天寿星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-天寿星.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-天寿星.json",
+                contract=_dummy_contract(),
+            )
+
+            with patch("A07_Development.run_task_result_turn_with_repair", return_value={}) as run_turn:
+                result = _run_single_reviewer_initialization(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                )
+
+        self.assertIs(result, reviewer)
+        run_turn.assert_called_once()
+        self.assertEqual(run_turn.call_args.kwargs["turn_start_timeout_sec"], A07_REVIEWER_TURN_START_TIMEOUT_SEC)
+        self.assertEqual(
+            run_turn.call_args.kwargs["prompt_submit_timeout_sec"],
+            A07_REVIEWER_PROMPT_SUBMIT_TIMEOUT_SEC,
+        )
+        self.assertEqual(
+            run_turn.call_args.kwargs["pre_submit_observation_tail_lines"],
+            A07_PRE_SUBMIT_OBSERVATION_TAIL_LINES,
+        )
+        self.assertEqual(
+            run_turn.call_args.kwargs["pre_submit_observation_tail_bytes"],
+            A07_PRE_SUBMIT_OBSERVATION_TAIL_BYTES,
+        )
+
+    def test_prelaunch_development_reviewers_uses_fast_ready_timeout_and_logs_slow_reviewer(self):
+        class SlowPrelaunchWorker(_FakeWorker):
+            def __init__(self, *, session_name: str):
+                super().__init__(session_name=session_name)
+                self.ensure_timeouts: list[float] = []
+                self.events: list[tuple[str, dict[str, object]]] = []
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.ensure_timeouts.append(timeout_sec)
+                raise RuntimeError("Timed out waiting for agent ready")
+
+            def _log_event(self, event, **payload):  # noqa: ANN001
+                self.events.append((event, payload))
+
+        worker = SlowPrelaunchWorker(session_name="测试工程师-天寿星")
+        reviewer = ReviewerRuntime(
+            reviewer_name="测试工程师",
+            selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+            worker=worker,
+            review_md_path=Path("/tmp/review.md"),
+            review_json_path=Path("/tmp/review.json"),
+            contract=_dummy_contract(),
+        )
+        notices: list[str] = []
+
+        returned = prelaunch_development_reviewers([reviewer], notify=notices.append)
+
+        self.assertEqual(returned, [reviewer])
+        self.assertEqual(worker.ensure_timeouts, [A07_REVIEWER_TURN_START_TIMEOUT_SEC])
+        self.assertEqual(worker.events[0][0], "reviewer_prelaunch_ready_timeout")
+        self.assertEqual(worker.events[0][1]["reviewer_name"], "测试工程师")
+        self.assertEqual(worker.events[0][1]["timeout_sec"], A07_REVIEWER_TURN_START_TIMEOUT_SEC)
+        self.assertIn(f"timeout={A07_REVIEWER_TURN_START_TIMEOUT_SEC}s", notices[0])
+
+    def test_initialize_developer_prelaunch_passes_fast_timeout(self):
+        developer = DeveloperRuntime(
+            selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+            worker=_ReconfigurableWorker(session_name="开发工程师-天魁星"),
+            role_prompt="实现视角",
+        )
+        reviewer = ReviewerRuntime(
+            reviewer_name="测试工程师",
+            selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+            worker=_FakeWorker(session_name="测试工程师-天寿星"),
+            review_md_path=Path("/tmp/review.md"),
+            review_json_path=Path("/tmp/review.json"),
+            contract=_dummy_contract(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            with patch(
+                "A07_Development.initialize_development_workers",
+                return_value=(developer, []),
+            ), patch(
+                "A07_Development.prelaunch_development_reviewers",
+                return_value=[reviewer],
+            ) as prelaunch:
+                returned_developer, returned_reviewers = initialize_developer_with_parallel_reviewer_prelaunch(
+                    developer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    reviewers=[reviewer],
+                    reviewer_specs_by_name={
+                        "测试工程师": DevelopmentReviewerSpec(
+                            role_name="测试工程师",
+                            role_prompt="测试视角",
+                            reviewer_key="测试工程师",
+                        )
+                    },
+                )
+
+        self.assertIs(returned_developer, developer)
+        self.assertEqual(returned_reviewers, [reviewer])
+        self.assertEqual(prelaunch.call_args.kwargs["timeout_sec"], A07_REVIEWER_TURN_START_TIMEOUT_SEC)
+
     def test_reviewer_turn_contract_error_accepts_late_valid_output_and_rewrites_state(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -782,8 +912,208 @@ class A07DevelopmentTests(unittest.TestCase):
 
             self.assertIs(result, reviewer)
             run_turn.assert_called_once()
+            self.assertEqual(run_turn.call_args.kwargs["turn_start_timeout_sec"], A07_REVIEWER_TURN_START_TIMEOUT_SEC)
+            self.assertEqual(
+                run_turn.call_args.kwargs["prompt_submit_timeout_sec"],
+                A07_REVIEWER_PROMPT_SUBMIT_TIMEOUT_SEC,
+            )
             self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), "")
             self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), [])
+
+    def test_parallel_reviewer_round_fast_dispatch_submits_all_ready_reviewers(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            expected_count = 6
+            sent_calls: list[dict[str, object]] = []
+            sent_lock = threading.Lock()
+            all_sent = threading.Event()
+
+            class ReadyReviewerWorker(_FakeWorker):
+                def run_turn(self, **kwargs):  # noqa: ANN001
+                    with sent_lock:
+                        sent_calls.append({"session_name": self.session_name, **kwargs})
+                        if len(sent_calls) == expected_count:
+                            all_sent.set()
+                    if not all_sent.wait(timeout=2.0):
+                        raise AssertionError("reviewer prompts were not dispatched in parallel")
+                    self._write_review_result(kwargs["completion_contract"], task_name="M1-T9")
+                    return CommandResult(
+                        label=str(kwargs["label"]),
+                        command="",
+                        exit_code=0,
+                        raw_output="审核通过",
+                        clean_output="审核通过",
+                        started_at="2026-05-10T00:00:00",
+                        finished_at="2026-05-10T00:00:01",
+                    )
+
+                @staticmethod
+                def _write_review_result(contract: TurnFileContract, *, task_name: str) -> None:
+                    review_md = contract.tracked_artifacts["review_md"]
+                    review_md.write_text("", encoding="utf-8")
+                    contract.status_path.write_text(
+                        json.dumps([{"task_name": task_name, "review_pass": True}], ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+
+            reviewers: list[ReviewerRuntime] = []
+            reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec] = {}
+            for index in range(expected_count):
+                reviewer_name = f"审核员{index + 1}"
+                reviewer_specs_by_name[reviewer_name] = DevelopmentReviewerSpec(
+                    role_name=reviewer_name,
+                    role_prompt="审核视角",
+                    reviewer_key=reviewer_name,
+                )
+                reviewers.append(
+                    ReviewerRuntime(
+                        reviewer_name=reviewer_name,
+                        selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+                        worker=ReadyReviewerWorker(session_name=f"{reviewer_name}-星"),
+                        review_md_path=project_dir / f"需求A_代码评审记录_{reviewer_name}-星.md",
+                        review_json_path=project_dir / f"需求A_评审记录_{reviewer_name}-星.json",
+                        contract=_dummy_contract(),
+                    )
+                )
+
+            returned = _run_parallel_reviewers(
+                reviewers,
+                project_dir=project_dir,
+                requirement_name="需求A",
+                paths=paths,
+                reviewer_specs_by_name=reviewer_specs_by_name,
+                task_name="M1-T9",
+                round_index=1,
+                prompt_builder=lambda reviewer: f"review {reviewer.reviewer_name}",
+                label_prefix="development_review_M1_T9",
+                allow_existing_outputs=False,
+            )
+
+        self.assertEqual(len(returned), expected_count)
+        self.assertEqual({str(call["session_name"]) for call in sent_calls}, {f"审核员{index + 1}-星" for index in range(expected_count)})
+        self.assertTrue(all_sent.is_set())
+        self.assertTrue(all(call["turn_start_timeout_sec"] == A07_REVIEWER_TURN_START_TIMEOUT_SEC for call in sent_calls))
+        self.assertTrue(all(call["prompt_submit_timeout_sec"] == A07_REVIEWER_PROMPT_SUBMIT_TIMEOUT_SEC for call in sent_calls))
+
+    def test_parallel_reviewer_round_slow_ready_reviewer_does_not_block_fast_reviewers(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            fast_sent: list[str] = []
+            fast_sent_lock = threading.Lock()
+            fast_reviewers_sent = threading.Event()
+            slow_started = threading.Event()
+            release_slow = threading.Event()
+            slow_worker_ref: dict[str, object] = {}
+
+            class SlowAwareReviewerWorker(_FakeWorker):
+                def __init__(self, *, session_name: str, slow: bool = False) -> None:
+                    super().__init__(session_name=session_name)
+                    self.slow = slow
+                    self.state_payload: dict[str, object] = {}
+
+                def read_state(self) -> dict[str, object]:
+                    return dict(self.state_payload)
+
+                def run_turn(self, **kwargs):  # noqa: ANN001
+                    if self.slow:
+                        self.state_payload.update(
+                            {
+                                "dispatch_state": "delayed",
+                                "dispatch_reason": "ready_wait_timeout:simulated slow ready",
+                            }
+                        )
+                        slow_started.set()
+                        if not release_slow.wait(timeout=2.0):
+                            raise AssertionError("slow reviewer was not released")
+                    else:
+                        with fast_sent_lock:
+                            fast_sent.append(self.session_name)
+                            if len(fast_sent) == 5:
+                                fast_reviewers_sent.set()
+                    self._write_review_result(kwargs["completion_contract"], task_name="M1-T10")
+                    return CommandResult(
+                        label=str(kwargs["label"]),
+                        command="",
+                        exit_code=0,
+                        raw_output="审核通过",
+                        clean_output="审核通过",
+                        started_at="2026-05-10T00:00:00",
+                        finished_at="2026-05-10T00:00:01",
+                    )
+
+                @staticmethod
+                def _write_review_result(contract: TurnFileContract, *, task_name: str) -> None:
+                    contract.tracked_artifacts["review_md"].write_text("", encoding="utf-8")
+                    contract.status_path.write_text(
+                        json.dumps([{"task_name": task_name, "review_pass": True}], ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+
+            reviewers: list[ReviewerRuntime] = []
+            reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec] = {}
+            for index in range(6):
+                reviewer_name = f"审核员{index + 1}"
+                reviewer_specs_by_name[reviewer_name] = DevelopmentReviewerSpec(
+                    role_name=reviewer_name,
+                    role_prompt="审核视角",
+                    reviewer_key=reviewer_name,
+                )
+                worker = SlowAwareReviewerWorker(session_name=f"{reviewer_name}-星", slow=index == 5)
+                if worker.slow:
+                    slow_worker_ref["worker"] = worker
+                reviewers.append(
+                    ReviewerRuntime(
+                        reviewer_name=reviewer_name,
+                        selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+                        worker=worker,
+                        review_md_path=project_dir / f"需求A_代码评审记录_{reviewer_name}-星.md",
+                        review_json_path=project_dir / f"需求A_评审记录_{reviewer_name}-星.json",
+                        contract=_dummy_contract(),
+                    )
+                )
+
+            result_box: dict[str, object] = {}
+
+            def run_round() -> None:
+                try:
+                    result_box["returned"] = _run_parallel_reviewers(
+                        reviewers,
+                        project_dir=project_dir,
+                        requirement_name="需求A",
+                        paths=paths,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
+                        task_name="M1-T10",
+                        round_index=1,
+                        prompt_builder=lambda reviewer: f"review {reviewer.reviewer_name}",
+                        label_prefix="development_review_M1_T10",
+                        allow_existing_outputs=False,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    result_box["error"] = error
+
+            thread = threading.Thread(target=run_round)
+            thread.start()
+            try:
+                self.assertTrue(fast_reviewers_sent.wait(timeout=2.0))
+                self.assertTrue(slow_started.wait(timeout=2.0))
+                self.assertEqual(len(fast_sent), 5)
+                self.assertTrue(thread.is_alive())
+                slow_worker = slow_worker_ref["worker"]
+                assert isinstance(slow_worker, SlowAwareReviewerWorker)
+                self.assertEqual(slow_worker.read_state()["dispatch_state"], "delayed")
+            finally:
+                release_slow.set()
+                thread.join(timeout=2.0)
+
+            if "error" in result_box:
+                raise result_box["error"]  # type: ignore[misc]
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(result_box["returned"]), 6)  # type: ignore[arg-type]
 
     def test_reviewer_protocol_repair_prompt_uses_check_reviewer_job_for_exact_paths(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1673,6 +2003,38 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertFalse(prompt_recovery.call_args.kwargs["can_skip"])
         recreate_runtime.assert_not_called()
 
+    def test_developer_result_turn_uses_fast_dispatch_budget(self):
+        developer = DeveloperRuntime(
+            selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+            worker=_ReconfigurableWorker(session_name="开发工程师-天魁星"),
+            role_prompt="实现视角",
+        )
+
+        with patch("A07_Development.run_task_result_turn_with_repair", return_value={"status": "completed"}) as run_turn:
+            returned, payload = _run_developer_result_turn(
+                developer,
+                label="developer_fast_dispatch",
+                prompt="请开发",
+                result_contract=_dummy_task_result_contract(),
+            )
+
+        self.assertIs(returned, developer)
+        self.assertEqual(payload["status"], "completed")
+        run_turn.assert_called_once()
+        self.assertEqual(run_turn.call_args.kwargs["turn_start_timeout_sec"], A07_REVIEWER_TURN_START_TIMEOUT_SEC)
+        self.assertEqual(
+            run_turn.call_args.kwargs["prompt_submit_timeout_sec"],
+            A07_REVIEWER_PROMPT_SUBMIT_TIMEOUT_SEC,
+        )
+        self.assertEqual(
+            run_turn.call_args.kwargs["pre_submit_observation_tail_lines"],
+            A07_PRE_SUBMIT_OBSERVATION_TAIL_LINES,
+        )
+        self.assertEqual(
+            run_turn.call_args.kwargs["pre_submit_observation_tail_bytes"],
+            A07_PRE_SUBMIT_OBSERVATION_TAIL_BYTES,
+        )
+
     def test_developer_ready_timeout_reopens_hitl_when_manual_retry_times_out_again(self):
         developer = DeveloperRuntime(
             selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
@@ -2232,6 +2594,9 @@ class A07DevelopmentTests(unittest.TestCase):
             ]
             call_order: list[str] = []
             developer_plan = DeveloperPlan(selection=developer.selection, role_prompt=developer.role_prompt)
+            developer_init_started = threading.Event()
+            reviewer_prelaunch_started = threading.Event()
+            reviewer_prelaunch_finished = threading.Event()
             develop_started = threading.Event()
             reviewer_init_started = threading.Event()
             develop_finished = threading.Event()
@@ -2241,14 +2606,26 @@ class A07DevelopmentTests(unittest.TestCase):
                 call_order.append(
                     f"initialize_development_workers:{kwargs['initialize_developer']}:{kwargs['initialize_reviewers']}"
                 )
+                if kwargs["initialize_developer"]:
+                    developer_init_started.set()
+                    self.assertTrue(reviewer_prelaunch_started.wait(timeout=1.0))
                 if kwargs["initialize_reviewers"]:
                     reviewer_init_started.set()
                     self.assertTrue(develop_started.wait(timeout=1.0))
                     reviewer_init_finished.set()
                 return current_developer, list(kwargs["reviewers"])
 
+            def fake_prelaunch_reviewers(reviewer_list, **kwargs):  # noqa: ANN001
+                _ = kwargs
+                call_order.append("prelaunch_development_reviewers")
+                reviewer_prelaunch_started.set()
+                self.assertTrue(developer_init_started.wait(timeout=1.0))
+                reviewer_prelaunch_finished.set()
+                return list(reviewer_list)
+
             def fake_develop(current_developer, **kwargs):  # noqa: ANN001
                 call_order.append("develop_current_task")
+                self.assertTrue(reviewer_prelaunch_finished.is_set())
                 develop_started.set()
                 self.assertTrue(reviewer_init_started.wait(timeout=1.0))
                 develop_finished.set()
@@ -2314,6 +2691,9 @@ class A07DevelopmentTests(unittest.TestCase):
                 "A07_Development.initialize_development_workers",
                 side_effect=fake_initialize_workers,
             ), patch(
+                "A07_Development.prelaunch_development_reviewers",
+                side_effect=fake_prelaunch_reviewers,
+            ), patch(
                 "A07_Development.resolve_subagent_num",
                 return_value=0,
             ), patch(
@@ -2341,10 +2721,13 @@ class A07DevelopmentTests(unittest.TestCase):
             "resolve_developer_plan",
             "collect_reviewer_agent_selections",
             "create_developer_runtime",
-            "initialize_development_workers:True:False",
+            "build_reviewer_workers",
         ])
-        self.assertLess(call_order.index("build_reviewer_workers"), call_order.index("develop_current_task"))
-        self.assertLess(call_order.index("build_reviewer_workers"), call_order.index("initialize_development_workers:False:True"))
+        self.assertLess(call_order.index("build_reviewer_workers"), call_order.index("initialize_development_workers:True:False"))
+        self.assertLess(call_order.index("build_reviewer_workers"), call_order.index("prelaunch_development_reviewers"))
+        self.assertLess(call_order.index("initialize_development_workers:True:False"), call_order.index("develop_current_task"))
+        self.assertLess(call_order.index("prelaunch_development_reviewers"), call_order.index("develop_current_task"))
+        self.assertLess(call_order.index("develop_current_task"), call_order.index("initialize_development_workers:False:True"))
         self.assertLess(call_order.index("develop_current_task"), call_order.index("_run_parallel_reviewers"))
         self.assertLess(call_order.index("initialize_development_workers:False:True"), call_order.index("_run_parallel_reviewers"))
 
