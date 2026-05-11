@@ -1546,6 +1546,178 @@ workspace (/directory)                                                     branc
             "[[ROUTING_AUDIT:WRITTEN]]",
         )
 
+    def test_wait_for_shell_ready_accepts_prompt_after_shell_startup_stderr(self):
+        class ShellReadyWorker(TmuxBatchWorker):
+            def __init__(self, *, observations, **kwargs):
+                super().__init__(**kwargs)
+                self._observations = list(observations)
+
+            def observe(self, *, tail_lines=120, tail_bytes=24000):  # noqa: ARG002
+                return self._observations.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            resolved_tmp_dir = str(Path(tmp_dir).resolve())
+            worker = ShellReadyWorker(
+                worker_id="shell-ready-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                observations=[
+                    WorkerObservation(
+                        visible_text=(
+                            "/Users/test/.zshrc:source:28: no such file or directory: "
+                            "/Users/test/.openclaw/completions/openclaw.zsh\n"
+                            "tester@host repo %"
+                        ),
+                        raw_log_delta="",
+                        raw_log_tail="",
+                        pane_title="host",
+                        current_command="zsh",
+                        current_path=resolved_tmp_dir,
+                        pane_dead=False,
+                        session_exists=True,
+                        log_mtime=0.0,
+                        observed_at="2026-05-11T12:00:00",
+                    ),
+                ],
+            )
+
+            worker._wait_for_shell_ready(timeout_sec=0.5)  # noqa: SLF001
+
+    def test_wait_for_shell_ready_accepts_stable_shell_context_without_byte_stable_output(self):
+        class ShellReadyWorker(TmuxBatchWorker):
+            def __init__(self, *, observations, **kwargs):
+                super().__init__(**kwargs)
+                self._observations = list(observations)
+
+            def observe(self, *, tail_lines=120, tail_bytes=24000):  # noqa: ARG002
+                return self._observations.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            resolved_tmp_dir = str(Path(tmp_dir).resolve())
+            worker = ShellReadyWorker(
+                worker_id="shell-stable-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                observations=[
+                    WorkerObservation(
+                        visible_text="loading shell hooks",
+                        raw_log_delta="noise-1",
+                        raw_log_tail="noise-1",
+                        pane_title="host",
+                        current_command="zsh",
+                        current_path=resolved_tmp_dir,
+                        pane_dead=False,
+                        session_exists=True,
+                        log_mtime=0.0,
+                        observed_at="2026-05-11T12:00:00",
+                    ),
+                    WorkerObservation(
+                        visible_text="loading shell hooks with redraw",
+                        raw_log_delta="noise-2",
+                        raw_log_tail="noise-2",
+                        pane_title="host",
+                        current_command="zsh",
+                        current_path=resolved_tmp_dir,
+                        pane_dead=False,
+                        session_exists=True,
+                        log_mtime=0.0,
+                        observed_at="2026-05-11T12:00:01",
+                    ),
+                ],
+            )
+
+            monotonic_values = iter((0.0, 0.1, 0.2, 0.3))
+            with mock.patch("T02_tmux_agents.time.monotonic", side_effect=lambda: next(monotonic_values)), mock.patch(
+                "T02_tmux_agents.time.sleep",
+                return_value=None,
+            ):
+                worker._wait_for_shell_ready(timeout_sec=1.0)  # noqa: SLF001
+
+    def test_wait_for_shell_ready_times_out_when_shell_stays_in_wrong_directory(self):
+        class WrongDirectoryWorker(TmuxBatchWorker):
+            def observe(self, *, tail_lines=120, tail_bytes=24000):  # noqa: ARG002
+                return WorkerObservation(
+                    visible_text="tester@host elsewhere %",
+                    raw_log_delta="",
+                    raw_log_tail="tester@host elsewhere %",
+                    pane_title="host",
+                    current_command="zsh",
+                    current_path="/tmp/elsewhere",
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-11T12:00:00",
+                )
+
+            def capture_visible(self, tail_lines=500):  # noqa: ARG002
+                return "tester@host elsewhere %"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = WrongDirectoryWorker(
+                worker_id="shell-wrong-dir-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+
+            monotonic_values = iter((0.0, 0.1, 0.6))
+            with mock.patch("T02_tmux_agents.time.monotonic", side_effect=lambda: next(monotonic_values)), mock.patch(
+                "T02_tmux_agents.time.sleep",
+                return_value=None,
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    worker._wait_for_shell_ready(timeout_sec=0.5)  # noqa: SLF001
+
+            self.assertIn("current_command=zsh", str(raised.exception))
+            self.assertIn("current_path=/tmp/elsewhere", str(raised.exception))
+            self.assertIn("prompt_detected=yes", str(raised.exception))
+            self.assertIn('"event": "shell_bootstrap_timeout"', worker.log_path.read_text(encoding="utf-8"))
+
+    def test_wait_for_shell_ready_fails_when_session_disappears(self):
+        class MissingSessionWorker(TmuxBatchWorker):
+            def observe(self, *, tail_lines=120, tail_bytes=24000):  # noqa: ARG002
+                return WorkerObservation(
+                    visible_text="",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    pane_title="",
+                    current_command="",
+                    current_path="",
+                    pane_dead=False,
+                    session_exists=False,
+                    log_mtime=0.0,
+                    observed_at="2026-05-11T12:00:00",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = MissingSessionWorker(
+                worker_id="shell-missing-session-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+
+            with self.assertRaises(RuntimeError) as raised:
+                worker._wait_for_shell_ready(timeout_sec=0.5)  # noqa: SLF001
+
+        self.assertEqual(str(raised.exception), "tmux pane exited before shell became ready")
+
+    def test_build_shell_bootstrap_command_keeps_interactive_login_shell_flags(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="shell-bootstrap-command-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+
+            with mock.patch.dict(runtime_module.os.environ, {"SHELL": "/bin/zsh"}, clear=False):
+                command = worker._build_shell_bootstrap_command()  # noqa: SLF001
+
+        self.assertIn("/bin/zsh -il", command)
+
     def test_run_turn_timeout_records_failed_state(self):
         class TimeoutWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -2599,7 +2771,6 @@ workspace (/directory)                                                     branc
         self.assertTrue(result.ok)
         self.assertEqual(len(worker.sent_prompts), 1)
         self.assertEqual(worker.wait_calls, 1)
-        self.assertGreaterEqual(worker.post_timeout_observes, 2)
 
     def test_run_turn_marks_wrapper_ready_after_success(self):
         class SubmitStateWorker(TmuxBatchWorker):
@@ -3909,7 +4080,7 @@ workspace (/directory)                                                     branc
             self.assertEqual(Path(parsed["status_path"]).resolve(), contract_path.resolve())
             self.assertEqual(Path(parsed["artifact_paths"]["artifact.json"]).resolve(), artifact_path.resolve())
 
-    def test_run_turn_with_completion_contract_does_not_finalize_after_unobserved_prompt_submission_timeout(self):
+    def test_run_turn_with_completion_contract_accepts_fresh_artifacts_after_prompt_confirm_timeout(self):
         class PromptTimeoutCompletionWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -4001,10 +4172,9 @@ workspace (/directory)                                                     branc
                 timeout_sec=1.0,
             )
 
-            self.assertFalse(result.ok)
-            self.assertEqual(len(worker.sent_prompts), 2)
-            self.assertEqual(json.loads(Path(worker.current_task_status_path).read_text(encoding="utf-8")), {"status": "running"})
-            self.assertIn("等待智能体确认收到 prompt 超时", result.clean_output)
+            self.assertTrue(result.ok)
+            self.assertEqual(len(worker.sent_prompts), 1)
+            self.assertIn("review_json", result.clean_output)
 
 
     def test_validate_task_result_file_requires_required_artifacts_and_hashes(self):
@@ -8655,6 +8825,87 @@ Do you trust the files in this folder?
         self.assertTrue(result.ok)
         self.assertEqual(worker.ensure_timeouts, [8.0])
         self.assertEqual(len(worker.sent_prompts), 1)
+
+    def test_run_turn_continues_waiting_for_artifacts_after_prompt_confirm_timeout(self):
+        class SlowConfirmCompletionWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts = []
+                self.artifact_waits = 0
+                self.state_notes = []
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "opencode"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "OC | ready"
+
+            def _write_state(self, status, *, note, extra=None):  # noqa: ANN001
+                self.state_notes.append((status.value if hasattr(status, "value") else status, note, dict(extra or {})))
+                super()._write_state(status, note=note, extra=extra)
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):  # noqa: ANN001, ARG002
+                raise TimeoutError("slow prompt echo")
+
+            def wait_for_turn_artifacts(self, *, contract, task_status_path=None, timeout_sec):  # noqa: ANN001, ARG002
+                self.artifact_waits += 1
+                if task_status_path is not None:
+                    write_task_status(task_status_path, status=TASK_STATUS_DONE)
+                self.current_task_runtime_status = TASK_STATUS_DONE
+                return TurnFileResult(
+                    status_path=str(contract.status_path),
+                    payload={"task_name": "M4-T4", "review_pass": True},
+                    artifact_paths={"review_md": str(Path(self.work_dir) / "review.md")},
+                    artifact_hashes={"review_md": "sha256:md"},
+                    validated_at="2026-05-10T00:00:00",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir).resolve()
+            contract_path = root / "review.json"
+
+            def validator(path: Path) -> TurnFileResult:  # noqa: ARG001
+                raise AssertionError("wait_for_turn_artifacts is stubbed")
+
+            worker = SlowConfirmCompletionWorker(
+                worker_id="slow-confirm-completion",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode-go/kimi-k2.6"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+
+            result = worker.run_turn(
+                label="development_review_init_M4-T4_测试工程师_round_1",
+                prompt="write review files",
+                completion_contract=TurnFileContract(
+                    turn_id="development_review_M4-T4_测试工程师",
+                    phase="任务开发",
+                    status_path=contract_path,
+                    validator=validator,
+                    quiet_window_sec=0.0,
+                ),
+                timeout_sec=5.0,
+                prompt_submit_timeout_sec=2.0,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertEqual(worker.artifact_waits, 1)
+        self.assertTrue(any(note.startswith("dispatch_delayed:") for _, note, _ in worker.state_notes))
+        self.assertFalse(any(status == WorkerStatus.FAILED.value for status, _, _ in worker.state_notes))
 
     def test_run_turn_result_contract_uses_default_pre_submit_observation_budget(self):
         class ResultContractWorker(TmuxBatchWorker):

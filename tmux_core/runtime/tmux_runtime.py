@@ -4327,26 +4327,58 @@ class TmuxBatchWorker:
 
     def _wait_for_shell_ready(self, timeout_sec: float = 12.0) -> None:
         deadline = time.monotonic() + timeout_sec
-        previous_output = ""
-        stable_count = 0
+        shell_context_stable_count = 0
+        last_current_command = ""
+        last_current_path = ""
+        last_prompt_detected = False
         while time.monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for prompt output stability")
             observation = self.observe(tail_lines=120)
             if not observation.session_exists:
                 raise RuntimeError("tmux pane exited before shell became ready")
+            if observation.pane_dead:
+                raise RuntimeError("tmux pane died before shell became ready")
             current_command = observation.current_command
             current_path = observation.current_path
-            visible = observation.raw_log_tail or observation.visible_text
+            prompt_detected = self._shell_prompt_visible(observation)
+            last_current_command = current_command
+            last_current_path = current_path
+            last_prompt_detected = prompt_detected
             if current_command in SHELL_COMMANDS and current_path == str(self.work_dir):
-                if visible == previous_output and visible.strip():
-                    stable_count += 1
-                else:
-                    stable_count = 0
-                if stable_count >= 1:
+                if prompt_detected:
                     return
-            previous_output = visible
+                shell_context_stable_count += 1
+                if shell_context_stable_count >= 2:
+                    return
+            else:
+                shell_context_stable_count = 0
             time.sleep(0.4)
-        raise RuntimeError(f"Shell initialization timed out.\n{self.capture_visible(120)}")
+        self._log_event(
+            "shell_bootstrap_timeout",
+            current_command=last_current_command,
+            current_path=last_current_path,
+            prompt_detected=last_prompt_detected,
+        )
+        raise RuntimeError(
+            "Shell initialization timed out. "
+            f"current_command={last_current_command or '(empty)'} "
+            f"current_path={last_current_path or '(empty)'} "
+            f"prompt_detected={'yes' if last_prompt_detected else 'no'}\n"
+            f"{self.capture_visible(120)}"
+        )
+
+    def _shell_prompt_visible(self, observation: WorkerObservation) -> bool:
+        combined_surface = "\n".join(
+            part for part in (observation.visible_text, observation.raw_log_tail) if str(part or "").strip()
+        )
+        if not combined_surface.strip():
+            return False
+        for line in reversed(combined_surface.splitlines()):
+            stripped = clean_ansi(line).strip()
+            if not stripped:
+                continue
+            return bool(re.search(r"[$%#]\s*$", stripped))
+        return False
 
     def _boot_action_allowed(self, action_signature: str, cooldown_sec: float = 3.0) -> bool:
         if (
@@ -5664,6 +5696,7 @@ class TmuxBatchWorker:
                     try:
                         self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
                         self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
+                        prompt_submission_observed = True
                     except TimeoutError as error:
                         self.dispatch_state = "delayed"
                         self.dispatch_reason = f"prompt_confirm_timeout:{error}"
@@ -5677,8 +5710,7 @@ class TmuxBatchWorker:
                             },
                         )
                         self._log_event("prompt_confirm_timeout", label=label, timeout_sec=prompt_confirmation_timeout)
-                        raise error
-                    prompt_submission_observed = True
+                        prompt_submission_observed = True
                     file_result = self.wait_for_turn_artifacts(
                         contract=completion_contract,
                         task_status_path=task_status_path,
@@ -5709,6 +5741,7 @@ class TmuxBatchWorker:
                         try:
                             self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
                             self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
+                            prompt_submission_observed = True
                         except TimeoutError as error:
                             self.dispatch_state = "delayed"
                             self.dispatch_reason = f"prompt_confirm_timeout:{error}"
@@ -5722,8 +5755,7 @@ class TmuxBatchWorker:
                                 },
                             )
                             self._log_event("prompt_confirm_timeout", label=label, timeout_sec=prompt_confirmation_timeout)
-                            raise error
-                        prompt_submission_observed = True
+                            prompt_submission_observed = True
                         task_result = self.wait_for_task_result(
                             contract=result_contract,
                             task_status_path=task_status_path,

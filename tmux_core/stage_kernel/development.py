@@ -16,7 +16,7 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -47,6 +47,7 @@ from tmux_core.runtime.contracts import (
 )
 from tmux_core.runtime.hitl import build_prefixed_sha256
 from tmux_core.runtime.tmux_runtime import (
+    AgentRuntimeState,
     CommandResult,
     DEFAULT_COMMAND_TIMEOUT_SEC,
     LaunchCoordinator,
@@ -1288,6 +1289,9 @@ def _run_developer_result_turn(
             return current_developer, payload
         except Exception as error:  # noqa: BLE001
             if is_agent_ready_timeout_error(error):
+                if replace_dead_developer is not None:
+                    current_developer = replace_dead_developer(current_developer, error)
+                    continue
                 developer_display_name = str(current_developer.worker.session_name or "开发工程师").strip() or "开发工程师"
                 prompt_agent_ready_timeout_recovery(
                     current_developer.worker,
@@ -1298,6 +1302,7 @@ def _run_developer_result_turn(
                         f"{developer_display_name}启动超时，未能进入可输入状态。\n"
                         "请先手动更换模型，再继续尝试当前 turn。"
                     ),
+                    allow_recreate=False,
                 )
                 continue
             if is_worker_death_error(error) and replace_dead_developer is not None:
@@ -1473,6 +1478,42 @@ def _reviewer_has_materialized_outputs(reviewer: ReviewerRuntime, task_name: str
     except ValueError:
         pass
     return not is_file_empty(reviewer.review_md_path)
+
+
+def _describe_reviewer_output_contract_issue(reviewer: ReviewerRuntime, task_name: str) -> str:
+    reviewer_label = _development_reviewer_display_name(reviewer)
+    if not reviewer.review_json_path.exists():
+        return f"{reviewer_label} 评审 JSON 缺失: {reviewer.review_json_path}"
+    try:
+        payload = json.loads(reviewer.review_json_path.read_text(encoding="utf-8"))
+    except Exception as error:  # noqa: BLE001
+        return f"{reviewer_label} 评审 JSON 无法解析: {error}"
+    try:
+        matched_item = normalize_review_status_payload(
+            payload,
+            task_name=task_name,
+            source=str(reviewer.review_json_path),
+        )
+    except ValueError as error:
+        return f"{reviewer_label} 评审 JSON 不完整: {error}"
+
+    review_pass = matched_item["review_pass"]
+    review_md_empty = is_file_empty(reviewer.review_md_path)
+    if review_pass and not review_md_empty:
+        return (
+            f"{reviewer_label} 评审文件不完整：review_pass=true 但 Markdown 未清空，"
+            f"请清空 {reviewer.review_md_path.name}。"
+        )
+    if (not review_pass) and review_md_empty:
+        return (
+            f"{reviewer_label} 评审文件不完整：review_pass=false 但 Markdown 为空，"
+            f"请在 {reviewer.review_md_path.name} 写明未通过原因和整改建议。"
+        )
+    return ""
+
+
+def _reviewer_outputs_satisfy_contract(reviewer: ReviewerRuntime, task_name: str) -> bool:
+    return not _describe_reviewer_output_contract_issue(reviewer, task_name)
 
 
 def _reviewer_artifact_signature(reviewer: ReviewerRuntime) -> tuple[object, ...]:
@@ -1911,7 +1952,7 @@ def _run_single_reviewer_initialization(
                     progress=progress,
                 )
                 if decision == AGENT_INTERVENTION_RECHECK:
-                    current_reviewer = failed_reviewer
+                    current_reviewer = _clear_reviewer_manual_recheck_state(failed_reviewer)
                     continue
                 if decision == AGENT_INTERVENTION_WORKER_DEAD:
                     _kill_development_reviewer_best_effort(failed_reviewer)
@@ -2004,6 +2045,7 @@ def _run_single_reviewer_initialization(
                     progress=progress,
                 )
                 if decision == AGENT_INTERVENTION_RECHECK:
+                    current_reviewer = _clear_reviewer_manual_recheck_state(current_reviewer)
                     continue
                 if decision == AGENT_INTERVENTION_WORKER_DEAD:
                     _kill_development_reviewer_best_effort(current_reviewer)
@@ -2453,6 +2495,101 @@ def _worker_appears_live_for_reviewer_recovery(worker: object | None) -> bool:
     return False
 
 
+def _clear_reviewer_manual_recheck_state(reviewer: ReviewerRuntime) -> ReviewerRuntime:
+    worker = reviewer.worker
+    state: dict[str, object] = {}
+    read_state = getattr(worker, "read_state", None)
+    if callable(read_state):
+        with suppress(Exception):
+            raw_state = read_state()
+            if isinstance(raw_state, dict):
+                state = raw_state
+    live_worker = _worker_appears_live_for_reviewer_recovery(worker)
+    agent_state_text = str(state.get("agent_state", "") or "").strip().upper()
+    ready_like = live_worker and agent_state_text in {"", "READY", "STARTING"}
+    busy_like = live_worker and agent_state_text == "BUSY"
+    if ready_like:
+        with suppress(Exception):
+            worker.agent_ready = True
+        with suppress(Exception):
+            worker.agent_state = AgentRuntimeState.READY
+    write_state = getattr(worker, "_write_state", None)
+    if callable(write_state):
+        extra = {
+            "result_status": WorkerStatus.READY.value if ready_like else "running",
+            "current_task_runtime_status": "",
+            "dispatch_state": "",
+            "dispatch_reason": "",
+            "health_status": "alive" if live_worker else str(state.get("health_status", "") or "unknown"),
+            "health_note": "manual_recheck",
+        }
+        if ready_like:
+            extra.update(
+                {
+                    "agent_ready": True,
+                    "agent_alive": True,
+                    "agent_state": AgentRuntimeState.READY.value,
+                }
+            )
+        elif busy_like:
+            extra.update(
+                {
+                    "agent_ready": False,
+                    "agent_alive": True,
+                    "agent_state": AgentRuntimeState.BUSY.value,
+                }
+            )
+        with suppress(Exception):
+            write_state(WorkerStatus.READY if ready_like else WorkerStatus.RUNNING, note="manual_recheck", extra=extra)
+    log_event = getattr(worker, "_log_event", None)
+    if callable(log_event):
+        with suppress(Exception):
+            log_event("manual_recheck_state_cleared", reviewer_name=reviewer.reviewer_name)
+    if reviewer.failure_streak or reviewer.last_failure_reason:
+        return replace(reviewer, failure_streak=0, last_failure_reason="")
+    return reviewer
+
+
+def _describe_reviewer_dispatch_blocker(worker: object | None) -> str:
+    if worker is None:
+        return ""
+    read_state = getattr(worker, "read_state", None)
+    if not callable(read_state):
+        return ""
+    try:
+        state = read_state()
+    except Exception:
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    dispatch_reason = str(state.get("dispatch_reason", "") or "").strip()
+    if dispatch_reason.startswith("prompt_confirm_timeout:"):
+        detail = dispatch_reason.split(":", 1)[1].strip()
+        return f"prompt 确认超时：已投递 prompt，但未观测到智能体确认。{detail}".strip()
+    if dispatch_reason.startswith("ready_wait_timeout:"):
+        detail = dispatch_reason.split(":", 1)[1].strip()
+        return f"等待智能体 READY 超时：{detail}".strip()
+    return dispatch_reason
+
+
+def _build_reviewer_recovery_reason(
+    reviewer: ReviewerRuntime,
+    *,
+    task_name: str,
+    fallback_reason: str,
+) -> str:
+    details = []
+    dispatch_blocker = _describe_reviewer_dispatch_blocker(reviewer.worker)
+    output_issue = _describe_reviewer_output_contract_issue(reviewer, task_name)
+    if dispatch_blocker:
+        details.append(dispatch_blocker)
+    if output_issue:
+        details.append(output_issue)
+    if details:
+        return f"{fallback_reason}\n" + "\n".join(details)
+    return fallback_reason
+
+
 def _wait_for_reviewer_materialized_outputs(
     reviewer: ReviewerRuntime,
     task_name: str,
@@ -2541,7 +2678,7 @@ def run_reviewer_turn_with_recreation(
 ) -> ReviewerRuntime | None:
     current_reviewer = reviewer
     while True:
-        if allow_existing_outputs and _reviewer_has_materialized_outputs(current_reviewer, task_name):
+        if allow_existing_outputs and _reviewer_outputs_satisfy_contract(current_reviewer, task_name):
             return current_reviewer
         ensure_review_artifacts(current_reviewer.review_md_path, current_reviewer.review_json_path)
         baseline_signature = _reviewer_artifact_signature(current_reviewer)
@@ -2569,7 +2706,11 @@ def run_reviewer_turn_with_recreation(
             return current_reviewer
         except Exception as error:  # noqa: BLE001
             outputs_materialized = _wait_for_reviewer_materialized_outputs(current_reviewer, task_name)
-            if outputs_materialized and _reviewer_artifact_signature(current_reviewer) != baseline_signature:
+            if (
+                outputs_materialized
+                and _reviewer_artifact_signature(current_reviewer) != baseline_signature
+                and _reviewer_outputs_satisfy_contract(current_reviewer, task_name)
+            ):
                 _mark_reviewer_turn_succeeded_from_materialized_outputs(
                     current_reviewer,
                     label=label,
@@ -2654,6 +2795,14 @@ def run_reviewer_turn_with_recreation(
                     progress=progress,
                 )
                 if decision == AGENT_INTERVENTION_RECHECK:
+                    current_reviewer = _clear_reviewer_manual_recheck_state(current_reviewer)
+                    if _reviewer_outputs_satisfy_contract(current_reviewer, task_name):
+                        _mark_reviewer_turn_succeeded_from_materialized_outputs(
+                            current_reviewer,
+                            label=label,
+                            task_name=task_name,
+                        )
+                        return current_reviewer
                     continue
                 if decision == AGENT_INTERVENTION_WORKER_DEAD:
                     _kill_development_reviewer_best_effort(current_reviewer)
@@ -2700,7 +2849,14 @@ def run_reviewer_turn_with_recreation(
                     progress=progress,
                 )
                 if decision == AGENT_INTERVENTION_RECHECK:
-                    current_reviewer = failed_reviewer
+                    current_reviewer = _clear_reviewer_manual_recheck_state(failed_reviewer)
+                    if _reviewer_outputs_satisfy_contract(current_reviewer, task_name):
+                        _mark_reviewer_turn_succeeded_from_materialized_outputs(
+                            current_reviewer,
+                            label=label,
+                            task_name=task_name,
+                        )
+                        return current_reviewer
                     continue
                 if decision == AGENT_INTERVENTION_WORKER_DEAD:
                     _kill_development_reviewer_best_effort(failed_reviewer)
@@ -2751,6 +2907,11 @@ def run_reviewer_turn_with_recreation(
                 if _worker_appears_live_for_reviewer_recovery(current_reviewer.worker)
                 else f"{reviewer_display_name} 无法继续执行当前审核任务。"
             )
+            reason_text = _build_reviewer_recovery_reason(
+                current_reviewer,
+                task_name=task_name,
+                fallback_reason=reason_text,
+            )
             decision = _prompt_development_reviewer_recovery(
                 current_reviewer,
                 reason_text=reason_text,
@@ -2758,6 +2919,14 @@ def run_reviewer_turn_with_recreation(
                 progress=progress,
             )
             if decision == AGENT_INTERVENTION_RECHECK:
+                current_reviewer = _clear_reviewer_manual_recheck_state(current_reviewer)
+                if _reviewer_outputs_satisfy_contract(current_reviewer, task_name):
+                    _mark_reviewer_turn_succeeded_from_materialized_outputs(
+                        current_reviewer,
+                        label=label,
+                        task_name=task_name,
+                    )
+                    return current_reviewer
                 continue
             if decision == AGENT_INTERVENTION_WORKER_DEAD:
                 _kill_development_reviewer_best_effort(current_reviewer)
@@ -3055,16 +3224,18 @@ def _replace_dead_developer(
     if error is not None and is_agent_ready_timeout_error(error):
         reason_text = (
             f"{developer_name}启动超时，未能进入可输入状态。\n"
-            "请先手动更换模型，再继续尝试当前 turn。"
+            "请检查、重建，或手动处理后继续当前 turn。"
         )
-        prompt_agent_ready_timeout_recovery(
+        decision = prompt_agent_ready_timeout_recovery(
             developer.worker,
             role_label=developer_name,
             can_skip=False,
             progress=progress,
             reason_text=reason_text,
+            allow_recreate=True,
         )
-        return developer
+        if decision != AGENT_INTERVENTION_RECREATE:
+            return developer
     startup_reconfigure = bool(error is not None and is_recoverable_startup_failure(error, developer.worker))
     if startup_reconfigure:
         reason_text = (

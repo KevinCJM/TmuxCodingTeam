@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import queue
 import signal
 import sys
@@ -2525,6 +2526,7 @@ class T11TuiBackendTests(unittest.TestCase):
             )
             for worker in list(server._workers.values()):  # noqa: SLF001
                 worker.join(timeout=2.0)
+            server._flush_dirty_snapshots()  # noqa: SLF001
         messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
         self.assertTrue(any(item.get("kind") == "response" and item.get("id") == "req_a05" for item in messages))
 
@@ -2541,6 +2543,7 @@ class T11TuiBackendTests(unittest.TestCase):
             )
             for worker in list(server._workers.values()):  # noqa: SLF001
                 worker.join(timeout=2.0)
+            server._flush_dirty_snapshots()  # noqa: SLF001
         messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
         log_events = [item for item in messages if item.get("kind") == "event" and item.get("type") == "log.append"]
         self.assertTrue(any("design failed" in str(item.get("payload", {}).get("text", "")) for item in log_events))
@@ -2588,6 +2591,7 @@ class T11TuiBackendTests(unittest.TestCase):
             )
             for worker in list(server._workers.values()):  # noqa: SLF001
                 worker.join(timeout=2.0)
+            server._flush_dirty_snapshots()  # noqa: SLF001
         messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
         responses = [item for item in messages if item.get("kind") == "response" and item.get("id") == "req_a05_snapshot"]
         self.assertTrue(responses)
@@ -2951,7 +2955,7 @@ class T11TuiBackendTests(unittest.TestCase):
                     )
                 )
                 for worker in list(server._workers.values()):  # noqa: SLF001
-                    worker.join(timeout=2.0)
+                    worker.join(timeout=5.0)
             messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
             failure_path = project_dir / ".tmux_workflow" / "需求A" / "stages" / "stage_a07_start.failure.json"
             failure_exists = failure_path.exists()
@@ -3021,6 +3025,83 @@ class T11TuiBackendTests(unittest.TestCase):
         broker._pending["prompt_1"] = prompt_queue  # noqa: SLF001
         broker.resolve("prompt_1", {"value": "second"})
         self.assertEqual(prompt_queue.get_nowait()["value"], "first")
+
+    def test_prompt_broker_unblocks_waiter_before_resolved_callback_finishes(self):
+        prompt_opened = threading.Event()
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        received: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+
+        def on_prompt_resolved(_prompt_id, _payload):  # noqa: ANN001
+            callback_entered.set()
+            release_callback.wait(timeout=2.0)
+
+        broker = PromptBroker(
+            lambda *_args, **_kwargs: prompt_opened.set(),
+            on_prompt_resolved=on_prompt_resolved,
+        )
+
+        def request_prompt() -> None:
+            received.put(
+                broker.request(
+                    BridgePromptRequest(
+                        prompt_type="select",
+                        payload={"title": "HITL", "default_value": "recheck"},
+                    )
+                )
+            )
+
+        requester = threading.Thread(target=request_prompt)
+        requester.start()
+        self.assertTrue(prompt_opened.wait(timeout=1.0))
+        prompt_id = next(iter(broker._pending))  # noqa: SLF001
+        resolver = threading.Thread(target=lambda: broker.resolve(prompt_id, {"value": "recheck"}))
+        resolver.start()
+        try:
+            self.assertTrue(callback_entered.wait(timeout=1.0))
+            self.assertEqual(received.get(timeout=1.0)["value"], "recheck")
+        finally:
+            release_callback.set()
+            requester.join(timeout=2.0)
+            resolver.join(timeout=2.0)
+
+    def test_prompt_resolved_schedules_lightweight_snapshot_after_unblocking(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        server._pending_prompts["prompt_1"] = PendingPromptState(  # noqa: SLF001
+            prompt_id="prompt_1",
+            prompt_type="select",
+            payload={"title": "HITL: 架构师 需要人工介入", "is_hitl": True},
+        )
+        server._pending_prompt = server._pending_prompts["prompt_1"]  # noqa: SLF001
+
+        with patch.object(server, "_emit_snapshot_update") as emit_snapshot, patch.object(
+            server,
+            "_schedule_snapshot_update",
+        ) as schedule_snapshot:
+            server._handle_prompt_resolved("prompt_1", {"value": "recheck_after_manual_intervention"})  # noqa: SLF001
+
+        emit_snapshot.assert_not_called()
+        schedule_snapshot.assert_called_once()
+        self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app", "hitl"})
+        self.assertFalse(schedule_snapshot.call_args.kwargs["refresh_worker_health"])
+
+    def test_prompt_open_schedules_lightweight_snapshot_without_sync_emit(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        request = BridgePromptRequest(
+            prompt_type="select",
+            payload={"title": "HITL: 架构师 需要人工介入", "is_hitl": True},
+        )
+
+        with patch.object(server, "_emit_snapshot_update", side_effect=AssertionError("sync snapshot should not run")) as emit_snapshot, patch.object(
+            server,
+            "_schedule_snapshot_update",
+        ) as schedule_snapshot:
+            server._handle_prompt_open("prompt_1", request)  # noqa: SLF001
+
+        emit_snapshot.assert_not_called()
+        schedule_snapshot.assert_called_once()
+        self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app", "hitl"})
+        self.assertFalse(schedule_snapshot.call_args.kwargs["refresh_worker_health"])
 
     def test_workflow_a00_start_runs_in_background(self):
         writer = io.StringIO()
@@ -3555,6 +3636,7 @@ class T11TuiBackendTests(unittest.TestCase):
                 )
                 for worker in list(server._workers.values()):  # noqa: SLF001
                     worker.join(timeout=2.0)
+                server._flush_dirty_snapshots()  # noqa: SLF001
 
         messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
         stage_events = [item for item in messages if item.get("kind") == "event" and item.get("type") == "stage.changed"]
@@ -3587,6 +3669,7 @@ class T11TuiBackendTests(unittest.TestCase):
         server = TuiBackendServer(reader=io.StringIO(), writer=writer)
         server._controls["run_demo"] = ControlSessionState(control_id="run_demo", center=_FakeCenter())  # noqa: SLF001
         server.handle_request(build_request("control.b01.open", {"control_id": "run_demo"}, message_id="req_3"))
+        server._flush_dirty_snapshots()  # noqa: SLF001
         messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
         payload = messages[0]["payload"]
         self.assertTrue(payload["supported"])
@@ -4039,6 +4122,43 @@ class T11TuiBackendTests(unittest.TestCase):
         load_worker.assert_not_called()
         self.assertEqual(workers[0]["session_name"], "sess-runtime")
 
+    def test_runtime_worker_scan_tolerates_concurrently_deleted_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            live_root = runtime_root / "worker-live"
+            disappearing_root = runtime_root / "worker-disappearing"
+            live_root.mkdir(parents=True)
+            disappearing_root.mkdir(parents=True)
+            (live_root / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "session_name": "sess-live",
+                        "work_dir": "/tmp/project",
+                        "status": "running",
+                        "agent_state": "BUSY",
+                        "health_status": "alive",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            real_scandir = os.scandir
+
+            def flaky_scandir(path):  # noqa: ANN001
+                if Path(path) == disappearing_root:
+                    raise FileNotFoundError(str(path))
+                return real_scandir(path)
+
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime = SimpleNamespace(session_exists=lambda name: name == "sess-live", backend=object())  # noqa: SLF001
+            with patch("tmux_core.bridge.backend.os.scandir", side_effect=flaky_scandir), patch(
+                "T11_tui_backend.load_worker_from_state_path"
+            ) as load_worker:
+                workers = server._scan_runtime_workers(runtime_root, refresh_health=False)  # noqa: SLF001
+
+        load_worker.assert_not_called()
+        self.assertEqual([worker["session_name"] for worker in workers], ["sess-live"])
+
     def test_handle_runtime_state_change_schedules_lightweight_snapshot_without_stage_inference(self):
         server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
         server._display_action = "stage.a07.start"  # noqa: SLF001
@@ -4051,6 +4171,64 @@ class T11TuiBackendTests(unittest.TestCase):
         schedule_snapshot.assert_called_once()
         infer_status.assert_not_called()
         self.assertFalse(schedule_snapshot.call_args.kwargs["refresh_worker_health"])
+
+    def test_stage_action_change_schedules_lightweight_snapshot_without_sync_emit(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        with patch.object(server, "_emit_snapshot_update", side_effect=AssertionError("sync snapshot should not run")) as emit_snapshot, patch.object(
+            server,
+            "_schedule_snapshot_update",
+        ) as schedule_snapshot, patch.object(server, "_infer_runtime_stage_status", return_value=""), patch.object(
+            server,
+            "_build_hitl_snapshot",
+            return_value={"pending": False},
+        ):
+            server._handle_runtime_stage_change("stage.a07.start")  # noqa: SLF001
+
+        emit_snapshot.assert_not_called()
+        schedule_snapshot.assert_called_once()
+        self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app"})
+        self.assertFalse(schedule_snapshot.call_args.kwargs["refresh_worker_health"])
+
+    def test_runner_completion_schedules_snapshot_without_waiting_for_heavy_emit(self):
+        writer = io.StringIO()
+        server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+
+        with patch.object(server, "_emit_snapshot_update", side_effect=AssertionError("sync snapshot should not run")) as emit_snapshot, patch.object(
+            server,
+            "_schedule_snapshot_update",
+        ) as schedule_snapshot, patch.object(server, "_maybe_chain_after_stage_success") as chain_after_success, patch.object(
+            server,
+            "_infer_runtime_stage_status",
+            return_value="",
+        ), patch.object(server, "_build_hitl_snapshot", return_value={"pending": False}):
+            server._run_in_thread("req_flow", "workflow.a00.start", lambda: 0, argv=[], respond=True)  # noqa: SLF001
+            for worker in list(server._workers.values()):  # noqa: SLF001
+                worker.join(timeout=2.0)
+
+        emit_snapshot.assert_not_called()
+        self.assertTrue(schedule_snapshot.called)
+        self.assertTrue(any(not call.kwargs.get("refresh_worker_health", True) for call in schedule_snapshot.call_args_list))
+        chain_after_success.assert_called_once()
+
+    def test_runner_failure_schedules_snapshot_without_sync_emit(self):
+        writer = io.StringIO()
+        server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+
+        with patch.object(server, "_emit_snapshot_update", side_effect=AssertionError("sync snapshot should not run")) as emit_snapshot, patch.object(
+            server,
+            "_schedule_snapshot_update",
+        ) as schedule_snapshot, patch.object(server, "_infer_runtime_stage_status", return_value=""), patch.object(
+            server,
+            "_build_hitl_snapshot",
+            return_value={"pending": False},
+        ):
+            server._run_in_thread("req_fail", "workflow.a00.start", lambda: (_ for _ in ()).throw(RuntimeError("boom")), respond=True)  # noqa: SLF001
+            for worker in list(server._workers.values()):  # noqa: SLF001
+                worker.join(timeout=2.0)
+
+        emit_snapshot.assert_not_called()
+        self.assertTrue(schedule_snapshot.called)
+        self.assertTrue(any(not call.kwargs.get("refresh_worker_health", True) for call in schedule_snapshot.call_args_list))
 
     def test_runtime_triggered_lightweight_snapshot_includes_dispatch_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4094,6 +4272,23 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(stage_events[0]["route"], "development")
         workers = stage_events[0]["snapshot"]["workers"]  # type: ignore[index]
         self.assertEqual(workers[0]["dispatch_state"], "submitting")
+
+    def test_flow_snapshot_flush_does_not_refresh_control_worker_health(self):
+        class RaisingRefreshCenter(_FakeCenter):
+            def refresh_worker_health(self) -> None:
+                raise AssertionError("flow snapshot should not refresh worker health")
+
+        writer = io.StringIO()
+        server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+        server._controls["run_demo"] = ControlSessionState(control_id="run_demo", center=RaisingRefreshCenter())  # noqa: SLF001
+
+        server._schedule_flow_snapshot_update(sections={"app", "control"})  # noqa: SLF001
+        server._flush_dirty_snapshots()  # noqa: SLF001
+
+        messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+        event_types = [item.get("type") for item in messages if item.get("kind") == "event"]
+        self.assertIn("snapshot.app", event_types)
+        self.assertIn("snapshot.control", event_types)
 
     def test_development_snapshot_recovers_sparse_health_state_from_tmux_identity(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5199,6 +5394,7 @@ class T11TuiBackendTests(unittest.TestCase):
             server._pending_prompt = server._pending_prompts["prompt-routing"]  # noqa: SLF001
 
             server._handle_prompt_resolved("prompt-routing", {"value": "no"})  # noqa: SLF001
+            server._flush_dirty_snapshots()  # noqa: SLF001
             snapshot = server._build_routing_snapshot()  # noqa: SLF001
             events = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
 
@@ -5451,6 +5647,7 @@ class T11TuiBackendTests(unittest.TestCase):
             server = TuiBackendServer(reader=io.StringIO(), writer=writer)
             server._controls["run_demo"] = ControlSessionState(control_id="run_demo", center=_FakeCenter())  # noqa: SLF001
             server.handle_request(build_request(action, {"control_id": "run_demo", "argument": "1"}, message_id=f"req_{action}"))
+            server._flush_dirty_snapshots()  # noqa: SLF001
             messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
             event_types = [item.get("type") for item in messages if item.get("kind") == "event"]
             self.assertIn("snapshot.app", event_types)

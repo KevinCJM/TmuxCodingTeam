@@ -83,7 +83,7 @@ export class BackendClient {
     const pending = [...this.pending.values()]
     this.pending.clear()
     for (const waiter of pending) {
-      waiter.reject(new Error('backend stopped'))
+      waiter.resolve({})
     }
     this.listeners.clear()
     const child = this.process

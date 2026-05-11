@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import datetime as dt
 import json
+import os
 import queue
 import re
 import shutil
@@ -175,12 +176,13 @@ class PromptBroker:
             prompt_queue = self._pending.get(str(prompt_id).strip())
         if prompt_queue is None:
             raise KeyError(f"未找到待处理 prompt: {prompt_id}")
-        if self._on_prompt_resolved is not None:
-            self._on_prompt_resolved(str(prompt_id).strip(), payload)
+        resolved_payload = dict(payload or {})
         try:
-            prompt_queue.put_nowait(dict(payload or {}))
+            prompt_queue.put_nowait(resolved_payload)
         except queue.Full:
             return
+        if self._on_prompt_resolved is not None:
+            self._on_prompt_resolved(str(prompt_id).strip(), resolved_payload)
 
     def shutdown(self, reason: str = "TUI backend 已关闭，取消等待中的输入。") -> None:
         normalized_reason = str(reason or "").strip() or "TUI backend 已关闭，取消等待中的输入。"
@@ -535,6 +537,17 @@ def _write_project_stage_state_record(
                     stale_state_path.unlink()
         if str(status or "").strip() in {"running", "awaiting-input"} and normalized_source != "runner_failure":
             _clear_project_stage_failure_record(record_dir=record_dir, action=action_text)
+        state_path = record_dir / f"{_stage_record_action_fragment(action_text)}.state.json"
+        if str(status or "").strip() in {"running", "awaiting-input"} and normalized_source == "runtime_inference":
+            with contextlib.suppress(Exception):
+                previous_payload = json.loads(state_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(previous_payload, Mapping)
+                    and str(previous_payload.get("action", "")).strip() == action_text
+                    and str(previous_payload.get("status", "")).strip() in {"failed", "error"}
+                    and str(previous_payload.get("source", "")).strip() == "runner_failure"
+                ):
+                    return state_path
         payload = {
             "action": action_text,
             "status": str(status or "").strip() or "ready",
@@ -546,7 +559,6 @@ def _write_project_stage_state_record(
             "failure_path": str(Path(failure_path).expanduser().resolve()) if str(failure_path).strip() else "",
             "message": str(message or "").strip(),
         }
-        state_path = record_dir / f"{_stage_record_action_fragment(action_text)}.state.json"
         state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return state_path
     except Exception:
@@ -1384,6 +1396,7 @@ class BridgeCore:
         self._display_status = "ready"
         self._display_action = ""
         self._display_stage_seq = 0
+        self._display_source = ""
         self._stage_seq_counter = 0
         self._stage_seq_lock = threading.Lock()
         self._snapshot_debounce_sec = 0.15
@@ -1485,9 +1498,8 @@ class BridgeCore:
         self._pending_prompt_display_state = None
         if prompt_display_state:
             self._emit_display_stage_state(**prompt_display_state)
-        self._emit_snapshot_update(
-            include_app=True,
-            include_hitl=True,
+        self._schedule_flow_snapshot_update(
+            sections={"app", "hitl"},
             stage_routes=self._stage_routes_for_action(self._display_action or self._context.current_action),
         )
 
@@ -1507,9 +1519,8 @@ class BridgeCore:
         latest_pending = self._latest_pending_prompt()
         self._pending_prompt = latest_pending
         self._attention_manager.resolve_prompt(prompt_id)
-        self._emit_snapshot_update(
-            include_app=True,
-            include_hitl=True,
+        self._schedule_flow_snapshot_update(
+            sections={"app", "hitl"},
             stage_routes=("routing",) if routing_snapshot_changed else (),
         )
 
@@ -1676,16 +1687,15 @@ class BridgeCore:
             preferred_stage_seq=stage_seq,
             force=True,
         )
-        self._emit_snapshot_update(
-            include_app=True,
+        self._schedule_flow_snapshot_update(
+            sections={"app"},
             stage_routes=self._stage_routes_for_action(normalized),
         )
 
     def _handle_runtime_state_change(self) -> None:
-        self._schedule_snapshot_update(
+        self._schedule_flow_snapshot_update(
             sections={"app", "control", "hitl"},
             stage_routes=self._stage_routes_for_action(self._display_action or self._context.current_action),
-            refresh_worker_health=False,
             update_display_stage=True,
         )
 
@@ -2038,12 +2048,7 @@ class BridgeCore:
             return []
         should_refresh_health = self._snapshot_refresh_worker_health if refresh_health is None else bool(refresh_health)
         workers: list[dict[str, Any]] = []
-        for state_path in sorted(root.glob("**/worker.state.json")):
-            try:
-                if "_locks" in state_path.relative_to(root).parts:
-                    continue
-            except ValueError:
-                pass
+        for state_path in self._iter_worker_state_paths(root):
             if should_refresh_health:
                 snapshot = self._refresh_running_worker_snapshot_if_needed(state_path)
             else:
@@ -2056,6 +2061,30 @@ class BridgeCore:
             if snapshot:
                 workers.append(snapshot)
         return workers
+
+    @staticmethod
+    def _iter_worker_state_paths(root: Path) -> list[Path]:
+        state_paths: list[Path] = []
+        pending = [root]
+        while pending:
+            current = pending.pop()
+            try:
+                with os.scandir(current) as entries_iter:
+                    entries = list(entries_iter)
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if entry.name == "_locks":
+                        continue
+                    if entry.name == "worker.state.json" and entry.is_file(follow_symlinks=False):
+                        state_paths.append(Path(entry.path))
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+                except OSError:
+                    continue
+        return sorted(state_paths)
 
     def _session_context_resolver(self) -> Callable[[str, Mapping[str, Any], str | Path], bool] | None:
         session_exists = getattr(self._tmux_runtime, "session_exists", None)
@@ -3272,6 +3301,11 @@ class BridgeCore:
         if not live_runtime_hitl_pending and action:
             live_runtime_hitl_pending = bool(self._build_runtime_worker_hitl_snapshot(action).get("pending", False))
         if explicit_status in {"failed", "error"}:
+            if source_text == "runner_failure" or (
+                source_text in {"", "runtime_inference"}
+                and str(getattr(self, "_display_source", "") or "").strip() == "runner_failure"
+            ):
+                return action, explicit_status, stage_seq
             if live_runtime_hitl_pending:
                 return action, "awaiting-input", stage_seq
             if runtime_status == "running":
@@ -3321,12 +3355,14 @@ class BridgeCore:
             self._display_action = action
             self._display_status = status
             self._display_stage_seq = stage_seq
+            self._display_source = str(source or "runtime_inference").strip() or "runtime_inference"
             return
         if not force and action == previous_action and status == previous_status and stage_seq == previous_stage_seq:
             return
         self._display_action = action
         self._display_status = status
         self._display_stage_seq = stage_seq
+        self._display_source = str(source or "runtime_inference").strip() or "runtime_inference"
         self.emit_event("stage.changed", {"action": action or "idle", "status": status, "stage_seq": stage_seq})
         _write_project_stage_state_record(
             project_dir=self._resolve_project_dir(),
@@ -3466,6 +3502,20 @@ class BridgeCore:
             include_hitl=True,
             include_artifacts=True,
             include_all_stages=True,
+        )
+
+    def _schedule_flow_snapshot_update(
+        self,
+        *,
+        sections: set[str],
+        stage_routes: Sequence[str] | None = None,
+        update_display_stage: bool = False,
+    ) -> None:
+        self._schedule_snapshot_update(
+            sections=sections,
+            stage_routes=stage_routes,
+            refresh_worker_health=False,
+            update_display_stage=update_display_stage,
         )
 
     def _schedule_snapshot_update(
@@ -3841,9 +3891,8 @@ class BridgeCore:
                     "message": message_text,
                 },
             )
-        self._emit_snapshot_update(
-            include_app=True,
-            include_artifacts=True,
+        self._schedule_flow_snapshot_update(
+            sections={"app", "artifacts"},
             stage_routes=self._stage_routes_for_action(action),
         )
 
@@ -3883,9 +3932,8 @@ class BridgeCore:
                     "message": message_text,
                 },
             )
-        self._emit_snapshot_update(
-            include_app=True,
-            include_artifacts=True,
+        self._schedule_flow_snapshot_update(
+            sections={"app", "artifacts"},
             stage_routes=self._stage_routes_for_action(action),
         )
 
@@ -3948,9 +3996,8 @@ class BridgeCore:
                     source="runner_complete",
                     force=True,
                 )
-                self._emit_snapshot_update(
-                    include_app=True,
-                    include_artifacts=True,
+                self._schedule_flow_snapshot_update(
+                    sections={"app", "artifacts"},
                     stage_routes=self._stage_routes_for_action(final_action),
                 )
                 if argv is not None:
@@ -4026,9 +4073,8 @@ class BridgeCore:
                     message=str(error),
                     force=True,
                 )
-                self._emit_snapshot_update(
-                    include_app=True,
-                    include_artifacts=True,
+                self._schedule_flow_snapshot_update(
+                    sections={"app", "artifacts"},
                     stage_routes=self._stage_routes_for_action(final_action or action),
                 )
             finally:
@@ -4132,12 +4178,7 @@ class BridgeCore:
         for runtime_root in self._project_runtime_roots(project_root):
             if not runtime_root.exists() or not runtime_root.is_dir():
                 continue
-            for state_path in sorted(runtime_root.glob("**/worker.state.json")):
-                try:
-                    if "_locks" in state_path.relative_to(runtime_root).parts:
-                        continue
-                except ValueError:
-                    pass
+            for state_path in self._iter_worker_state_paths(runtime_root):
                 payload = _safe_json_read(state_path)
                 if not payload:
                     continue
@@ -4607,7 +4648,7 @@ class BridgeCore:
                 result = self._open_control_session(request_payload)
                 if respond and normalized_request_id:
                     self.emit_response(normalized_request_id, ok=True, payload=result)
-                self._emit_snapshot_update(include_control=True)
+                self._schedule_flow_snapshot_update(sections={"control"})
                 return result
             self._run_in_thread(normalized_request_id if respond else "", normalized_action, lambda: self._open_control_session(request_payload), respond=respond)
             return {"accepted": True, "deferred": True}
@@ -4615,7 +4656,7 @@ class BridgeCore:
             result = self._handle_worker_attach(request_payload)
             if respond and normalized_request_id:
                 self.emit_response(normalized_request_id, ok=True, payload=result)
-            self._emit_snapshot_update(include_app=True, include_control=True)
+            self._schedule_flow_snapshot_update(sections={"app", "control"})
             return result
         if normalized_action == "worker.detach":
             result = self._run_worker_control_action(
@@ -4625,7 +4666,7 @@ class BridgeCore:
             )
             if respond and normalized_request_id:
                 self.emit_response(normalized_request_id, ok=True, payload=result)
-            self._emit_snapshot_update(include_app=True, include_control=True)
+            self._schedule_flow_snapshot_update(sections={"app", "control"})
             return result
         if normalized_action == "worker.kill":
             result = self._run_worker_control_action(
@@ -4635,7 +4676,7 @@ class BridgeCore:
             )
             if respond and normalized_request_id:
                 self.emit_response(normalized_request_id, ok=True, payload=result)
-            self._emit_snapshot_update(include_app=True, include_control=True)
+            self._schedule_flow_snapshot_update(sections={"app", "control"})
             return result
         if normalized_action == "worker.restart":
             result = self._run_worker_control_action(
@@ -4646,7 +4687,7 @@ class BridgeCore:
             )
             if respond and normalized_request_id:
                 self.emit_response(normalized_request_id, ok=True, payload=result)
-            self._emit_snapshot_update(include_app=True, include_control=True)
+            self._schedule_flow_snapshot_update(sections={"app", "control"})
             return result
         if normalized_action == "worker.retry":
             result = self._run_worker_control_action(
@@ -4657,19 +4698,19 @@ class BridgeCore:
             )
             if respond and normalized_request_id:
                 self.emit_response(normalized_request_id, ok=True, payload=result)
-            self._emit_snapshot_update(include_app=True, include_control=True)
+            self._schedule_flow_snapshot_update(sections={"app", "control"})
             return result
         if normalized_action == "run.list":
             result = self._handle_run_list(request_payload)
             if respond and normalized_request_id:
                 self.emit_response(normalized_request_id, ok=True, payload=result)
-            self._emit_snapshot_update(include_app=True)
+            self._schedule_flow_snapshot_update(sections={"app"})
             return result
         if normalized_action == "run.resume":
             result = self._handle_resume_control(request_payload)
             if respond and normalized_request_id:
                 self.emit_response(normalized_request_id, ok=True, payload=result)
-            self._emit_snapshot_update(include_app=True, include_control=True)
+            self._schedule_flow_snapshot_update(sections={"app", "control"})
             return result
         raise ValueError(f"不支持的 action: {normalized_action}")
 
