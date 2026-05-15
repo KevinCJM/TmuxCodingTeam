@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import threading
 import uuid
@@ -1250,12 +1251,18 @@ class RunStore:
     def write_manifest(self) -> Path:
         with self._lock:
             self.manifest.updated_at = _now_iso()
-            tmp_path = self.manifest_path.with_suffix(".tmp")
-            tmp_path.write_text(
-                json.dumps(self.manifest.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            tmp_path = self.manifest_path.with_name(
+                f"{self.manifest_path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
             )
-            tmp_path.replace(self.manifest_path)
+            try:
+                tmp_path.write_text(
+                    json.dumps(self.manifest.to_dict(), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                tmp_path.replace(self.manifest_path)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
         return self.manifest_path
 
     def append_event(self, event_type: str, **payload: object) -> None:

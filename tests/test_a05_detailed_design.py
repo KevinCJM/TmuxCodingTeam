@@ -1732,7 +1732,7 @@ class A05DetailedDesignTests(unittest.TestCase):
         self.assertIsNone(returned)
         recreate_mock.assert_called_once()
 
-    def test_run_reviewer_turn_with_recreation_reuses_materialized_outputs_after_runtime_failure(self):
+    def test_run_reviewer_turn_with_recreation_normalizes_valid_materialized_outputs_after_runtime_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             reviewer = create_reviewer_runtime(
@@ -1749,7 +1749,7 @@ class A05DetailedDesignTests(unittest.TestCase):
             def fake_run_turn(**kwargs):  # noqa: ANN001
                 reviewer.review_md_path.write_text("- [Ambiguity] still unresolved\n", encoding="utf-8")
                 reviewer.review_json_path.write_text(
-                    json.dumps([{"task_name": "详细设计", "review_pass": True}], ensure_ascii=False),
+                    json.dumps([{"task_name": "详细设计", "review_pass": False}], ensure_ascii=False),
                     encoding="utf-8",
                 )
                 return SimpleNamespace(ok=False, clean_output="runtime failed")
@@ -1767,8 +1767,119 @@ class A05DetailedDesignTests(unittest.TestCase):
                     label="review",
                     prompt="do review",
                 )
+            state = reviewer.worker.read_state()
+            self.assertEqual(state["status"], "succeeded")
+            self.assertEqual(state["result_status"], "succeeded")
+            self.assertEqual(state["agent_state"], "READY")
+            self.assertEqual(state["current_task_runtime_status"], "done")
 
         self.assertIs(returned, reviewer)
+
+    def test_run_reviewer_turn_with_recreation_rejects_invalid_materialized_outputs_after_runtime_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            reviewer = create_reviewer_runtime(
+                project_dir=root,
+                requirement_name="需求A",
+                reviewer_spec=DetailedDesignReviewerSpec(
+                    role_name="架构师",
+                    role_prompt="架构检查",
+                    reviewer_key="架构师#1",
+                ),
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+            )
+
+            def fake_run_turn(**kwargs):  # noqa: ANN001
+                reviewer.review_md_path.write_text("- stale issue should make pass invalid\n", encoding="utf-8")
+                reviewer.review_json_path.write_text(
+                    json.dumps([{"task_name": "详细设计", "review_pass": True}], ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(ok=False, clean_output="runtime failed")
+
+            with patch.object(reviewer.worker, "run_turn", side_effect=fake_run_turn):
+                with self.assertRaisesRegex(RuntimeError, "runtime failed"):
+                    run_reviewer_turn_with_recreation(
+                        reviewer,
+                        project_dir=root,
+                        requirement_name="需求A",
+                        reviewer_spec=DetailedDesignReviewerSpec(
+                            role_name="架构师",
+                            role_prompt="架构检查",
+                            reviewer_key="架构师#1",
+                        ),
+                        label="review",
+                        prompt="do review",
+                    )
+
+    def test_run_ba_turn_with_recovery_normalizes_valid_feedback_outputs_after_runtime_failure(self):
+        from A05_DetailedDesign import build_detailed_design_feedback_result_contract, run_ba_turn_with_recovery
+
+        class FakeBaWorker:
+            session_name = "分析师-心月狐"
+            current_task_result_path = ""
+
+            def __init__(self, state):
+                self.state = dict(state)
+
+            def read_state(self):
+                return dict(self.state)
+
+            def set_runtime_metadata(self, **metadata):
+                self.state.update(metadata)
+
+            def _record_result(self, result, *, status, note, extra):  # noqa: ANN001
+                self.state.update(extra)
+                self.state["status"] = status.value
+                self.state["note"] = note
+                self.state["clean_output"] = result.clean_output
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = build_detailed_design_paths(root, "需求A")
+            paths["detailed_design_path"].write_text("详细设计正文\n", encoding="utf-8")
+            paths["ba_feedback_path"].write_text("- [属实问题]: 已修复\n", encoding="utf-8")
+            task_status_path = root / "task_status.json"
+            result_path = root / "task_result.json"
+            task_status_path.write_text(json.dumps({"status": "running"}, ensure_ascii=False), encoding="utf-8")
+            worker = FakeBaWorker(
+                {
+                    "current_task_status_path": str(task_status_path),
+                    "current_task_result_path": str(result_path),
+                    "status": "running",
+                    "result_status": "running",
+                    "agent_state": "BUSY",
+                    "current_task_runtime_status": "running",
+                }
+            )
+            handoff = RequirementsAnalystHandoff(
+                worker=worker,
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+
+            with patch("A05_DetailedDesign._run_ba_turn", side_effect=RuntimeError("timeout")):
+                returned, payload = run_ba_turn_with_recovery(
+                    handoff,
+                    project_dir=root,
+                    requirement_name="需求A",
+                    label="modify_detailed_design",
+                    prompt="modify",
+                    result_contract=build_detailed_design_feedback_result_contract(paths),
+                    initialize_on_replacement=False,
+                    paths=paths,
+                )
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8"))["status"], "done")
+            self.assertTrue(result_path.exists())
+
+        self.assertIs(returned, handoff)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(worker.state["status"], "succeeded")
+        self.assertEqual(worker.state["result_status"], "succeeded")
+        self.assertEqual(worker.state["agent_state"], "READY")
+        self.assertEqual(worker.state["current_task_runtime_status"], "done")
 
     def test_run_stage_requires_nonempty_ba_feedback_before_again_review(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections import Counter
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
@@ -34,16 +35,22 @@ from tmux_core.prompt_contracts.detailed_design import (
     review_detailed_design,
 )
 from tmux_core.runtime.contracts import (
+    TASK_STATUS_DONE,
     TaskResultContract,
     TurnFileContract,
     TurnFileResult,
+    finalize_task_result,
     normalize_review_status_payload,
+    resolve_task_result_decision,
+    write_task_status,
 )
 from tmux_core.runtime.hitl import build_prefixed_sha256
 from tmux_core.runtime.tmux_runtime import (
+    CommandResult,
     DEFAULT_COMMAND_TIMEOUT_SEC,
     TmuxBatchWorker,
     Vendor,
+    WorkerStatus,
     build_session_name,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
@@ -90,6 +97,7 @@ from tmux_core.stage_kernel.shared_review import (
     collect_reviewer_agent_selections,
     ensure_empty_file,
     ensure_review_artifacts,
+    mark_reviewer_turn_succeeded_from_materialized_outputs,
     mark_worker_awaiting_reconfiguration,
     parse_review_max_rounds,
     prompt_positive_int,
@@ -103,6 +111,9 @@ from tmux_core.stage_kernel.shared_review import (
     render_review_agent_selection,
     render_tmux_start_summary,
     is_agent_config_error,
+    reviewer_artifact_signature,
+    reviewer_outputs_satisfy_contract,
+    reviewer_worker_needs_terminal_success_normalization,
     resolve_agent_run_config_with_recovery,
     resolve_stage_agent_config,
     run_review_limit_hitl_cycle,
@@ -1140,6 +1151,104 @@ def _parse_result_payload(clean_output: str) -> dict[str, object]:
     return payload
 
 
+A05_BA_FEEDBACK_MODES = {"a05_detailed_design_feedback", "a05_detailed_design_review_limit_human_reply"}
+
+
+def _scope_detailed_design_worker(worker: object, *, project_dir: str | Path, requirement_name: str = "") -> None:
+    set_runtime_metadata = getattr(worker, "set_runtime_metadata", None)
+    if not callable(set_runtime_metadata):
+        return
+    with suppress(Exception):
+        set_runtime_metadata(
+            project_dir=str(Path(project_dir).expanduser().resolve()),
+            requirement_name=str(requirement_name or "").strip(),
+            workflow_action="stage.a05.start",
+        )
+
+
+def _detailed_design_task_result_decision(result_contract: TaskResultContract):
+    if result_contract.mode not in A05_BA_FEEDBACK_MODES:
+        return None
+    try:
+        return resolve_task_result_decision(result_contract)
+    except Exception:
+        return None
+
+
+def _task_result_decision_payload(decision) -> dict[str, object]:
+    return {
+        "status": str(getattr(decision, "status", "") or "").strip(),
+        "summary": str(getattr(decision, "summary", "") or "").strip(),
+        "artifacts": dict(getattr(decision, "artifacts", {}) or {}),
+        "artifact_hashes": dict(getattr(decision, "artifact_hashes", {}) or {}),
+    }
+
+
+def _mark_ba_turn_succeeded_from_materialized_outputs(
+    handoff: RequirementsAnalystHandoff,
+    *,
+    label: str,
+    result_contract: TaskResultContract,
+    decision,
+) -> None:
+    worker = handoff.worker
+    state: dict[str, object] = {}
+    read_state = getattr(worker, "read_state", None)
+    if callable(read_state):
+        with suppress(Exception):
+            raw_state = read_state()
+            if isinstance(raw_state, dict):
+                state = raw_state
+    task_status_path_text = str(state.get("current_task_status_path", "") or "").strip()
+    result_path_text = str(
+        state.get("current_task_result_path", "") or getattr(worker, "current_task_result_path", "") or ""
+    ).strip()
+    if task_status_path_text:
+        with suppress(Exception):
+            write_task_status(Path(task_status_path_text).expanduser().resolve(), status=TASK_STATUS_DONE)
+    if result_path_text:
+        with suppress(Exception):
+            finalize_task_result(
+                contract=result_contract,
+                result_path=Path(result_path_text).expanduser().resolve(),
+                task_status_path=Path(task_status_path_text).expanduser().resolve() if task_status_path_text else None,
+            )
+    extra = {
+        "label": label,
+        "result_status": "succeeded",
+        "current_task_status_path": task_status_path_text,
+        "current_task_result_path": result_path_text,
+        "current_task_runtime_status": TASK_STATUS_DONE,
+        "agent_started": True,
+        "agent_ready": True,
+        "agent_state": "READY",
+        "health_status": "alive",
+        "health_note": "alive",
+    }
+    record_result = getattr(worker, "_record_result", None)
+    if callable(record_result):
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        record_result(
+            CommandResult(
+                label=label,
+                command="",
+                exit_code=0,
+                raw_output=json.dumps(_task_result_decision_payload(decision), ensure_ascii=False),
+                clean_output=json.dumps(_task_result_decision_payload(decision), ensure_ascii=False),
+                started_at=timestamp,
+                finished_at=timestamp,
+            ),
+            status=WorkerStatus.SUCCEEDED,
+            note=f"done:{label}",
+            extra=extra,
+        )
+        return
+    write_state = getattr(worker, "_write_state", None)
+    if callable(write_state):
+        with suppress(Exception):
+            write_state(WorkerStatus.SUCCEEDED, note=f"done:{label}", extra=extra)
+
+
 def _run_ba_turn(
     handoff: RequirementsAnalystHandoff,
     *,
@@ -1218,6 +1327,11 @@ def run_ba_turn_with_recovery(
     current_handoff = handoff
     needs_initialize = False
     while True:
+        _scope_detailed_design_worker(
+            current_handoff.worker,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+        )
         try:
             if needs_initialize:
                 _run_ba_turn(
@@ -1233,8 +1347,26 @@ def run_ba_turn_with_recovery(
                 prompt=prompt,
                 result_contract=result_contract,
             )
+            decision = _detailed_design_task_result_decision(result_contract)
+            if decision is not None:
+                _mark_ba_turn_succeeded_from_materialized_outputs(
+                    current_handoff,
+                    label=label,
+                    result_contract=result_contract,
+                    decision=decision,
+                )
+                payload = _task_result_decision_payload(decision)
             return current_handoff, payload
         except Exception as error:  # noqa: BLE001
+            decision = _detailed_design_task_result_decision(result_contract)
+            if decision is not None:
+                _mark_ba_turn_succeeded_from_materialized_outputs(
+                    current_handoff,
+                    label=label,
+                    result_contract=result_contract,
+                    decision=decision,
+                )
+                return current_handoff, _task_result_decision_payload(decision)
             ba_display_name = _detailed_design_ba_display_name(project_dir=project_dir, handoff=current_handoff)
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_handoff.worker)
             provider_runtime_error = worker_has_provider_runtime_error(current_handoff.worker)
@@ -1408,32 +1540,24 @@ def _build_reviewer_turn_goal() -> CompletionTurnGoal:
     )
 
 
-def _reviewer_has_materialized_outputs(reviewer: ReviewerRuntime) -> bool:
-    try:
-        payload = json.loads(reviewer.review_json_path.read_text(encoding="utf-8"))
-    except Exception:
-        payload = None
-    try:
-        normalize_review_status_payload(
-            payload,
-            task_name=DETAILED_DESIGN_TASK_NAME,
-            source=str(reviewer.review_json_path),
-        )
-        return True
-    except ValueError:
-        pass
-    return not is_file_empty(reviewer.review_md_path)
+def _reviewer_outputs_satisfy_contract(reviewer: ReviewerRuntime) -> bool:
+    return reviewer_outputs_satisfy_contract(reviewer)
 
 
 def _reviewer_artifact_signature(reviewer: ReviewerRuntime) -> tuple[object, ...]:
-    signatures: list[object] = []
-    for path in (reviewer.review_md_path, reviewer.review_json_path):
-        if not path.exists():
-            signatures.append(("missing", str(path.resolve())))
-            continue
-        stat = path.stat()
-        signatures.append((str(path.resolve()), stat.st_size, stat.st_mtime_ns))
-    return tuple(signatures)
+    return reviewer_artifact_signature(reviewer)
+
+
+def _mark_reviewer_turn_succeeded_from_materialized_outputs(
+        reviewer: ReviewerRuntime,
+        *,
+        label: str,
+) -> None:
+    mark_reviewer_turn_succeeded_from_materialized_outputs(
+        reviewer,
+        label=label,
+        task_name=DETAILED_DESIGN_TASK_NAME,
+    )
 
 
 def create_reviewer_runtime(
@@ -1543,6 +1667,7 @@ def run_reviewer_turn_with_recreation(
 ) -> ReviewerRuntime | None:
     current_reviewer = reviewer
     while True:
+        baseline_satisfies_contract = _reviewer_outputs_satisfy_contract(current_reviewer)
         ensure_review_artifacts(current_reviewer.review_md_path, current_reviewer.review_json_path)
         baseline_signature = _reviewer_artifact_signature(current_reviewer)
         try:
@@ -1556,18 +1681,31 @@ def run_reviewer_turn_with_recreation(
                 stage_label=DETAILED_DESIGN_TASK_NAME,
                 role_label=_reviewer_artifact_agent_name(current_reviewer),
             )
+            if _reviewer_outputs_satisfy_contract(current_reviewer):
+                _mark_reviewer_turn_succeeded_from_materialized_outputs(
+                    current_reviewer,
+                    label=label,
+                )
             return current_reviewer
         except Exception as error:  # noqa: BLE001
             reviewer_display_name = _reviewer_artifact_agent_name(current_reviewer)
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
             provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
-            if is_turn_artifact_contract_error(error):
-                return current_reviewer
             if (
-                _reviewer_has_materialized_outputs(current_reviewer)
-                and _reviewer_artifact_signature(current_reviewer) != baseline_signature
+                _reviewer_outputs_satisfy_contract(current_reviewer)
+                and (
+                    not baseline_satisfies_contract
+                    or _reviewer_artifact_signature(current_reviewer) != baseline_signature
+                    or reviewer_worker_needs_terminal_success_normalization(current_reviewer)
+                )
             ):
+                _mark_reviewer_turn_succeeded_from_materialized_outputs(
+                    current_reviewer,
+                    label=label,
+                )
+                return current_reviewer
+            if is_turn_artifact_contract_error(error):
                 return current_reviewer
             if auth_error or provider_runtime_error or ready_timeout_error:
                 reason_text = (
@@ -1746,7 +1884,7 @@ def repair_reviewer_outputs(
 ) -> list[ReviewerRuntime]:
     json_pattern = f"{sanitize_requirement_name(requirement_name)}_评审记录_*.json"
     md_pattern = f"{sanitize_requirement_name(requirement_name)}_详设评审记录_*.md"
-    return repair_reviewer_round_outputs(
+    repaired_reviewers = repair_reviewer_round_outputs(
         reviewers,
         key_func=lambda reviewer: reviewer.reviewer_name,
         artifact_name_func=_reviewer_artifact_agent_name,
@@ -1779,6 +1917,13 @@ def repair_reviewer_outputs(
             progress=progress,
         ),
     )
+    for reviewer in repaired_reviewers:
+        if _reviewer_outputs_satisfy_contract(reviewer):
+            _mark_reviewer_turn_succeeded_from_materialized_outputs(
+                reviewer,
+                label=f"detailed_design_repair_verified_{reviewer.reviewer_name}_round_{round_index}",
+            )
+    return repaired_reviewers
 
 
 def _collect_design_hitl_response(

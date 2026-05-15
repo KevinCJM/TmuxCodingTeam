@@ -114,6 +114,34 @@ test('bootstrap infers running when active stage has a busy worker', () => {
   ).toBe('running')
 })
 
+test('bootstrap keeps runner failure status ahead of live worker inference', () => {
+  expect(
+    inferBootstrapStatus({
+      snapshots: {
+        app: {
+          active_stage: 'stage.a07.start',
+          active_stage_status: 'failed',
+          pending_hitl: false,
+        },
+        stages: {
+          development: {
+            workers: [
+              {
+                session_name: '开发工程师-昴日鸡',
+                status: 'running',
+                agent_state: 'BUSY',
+                health_status: 'alive',
+                current_task_runtime_status: 'running',
+                session_exists: true,
+              },
+            ],
+          },
+        },
+      },
+    }),
+  ).toBe('failed')
+})
+
 test('bootstrap maps control session action to routing stage workers', () => {
   expect(
     inferBootstrapStatus({
@@ -161,6 +189,25 @@ test('bootstrap keeps awaiting-input ahead of worker activity', () => {
                 session_exists: true,
               },
             ],
+          },
+        },
+      },
+    }),
+  ).toBe('awaiting-input')
+})
+
+test('bootstrap treats pending attention as awaiting-input without HITL', () => {
+  expect(
+    inferBootstrapStatus({
+      snapshots: {
+        app: {
+          active_stage: 'stage.a08.start',
+          pending_hitl: false,
+          pending_attention: true,
+        },
+        stages: {
+          'overall-review': {
+            workers: [],
           },
         },
       },
@@ -220,6 +267,28 @@ test('failed status does not recover from idle READY sessions after a stage runn
   ).toBe(false)
 })
 
+test('failed status recovers from live BUSY worker even when stale failed status remains', () => {
+  expect(
+    shouldRecoverRunningFromStageSnapshot(
+      'failed',
+      'stage.a07.start',
+      'development',
+      {
+        workers: [
+          {
+            session_name: '开发工程师-地威星',
+            status: 'failed',
+            agent_state: 'BUSY',
+            health_status: 'alive',
+            current_task_runtime_status: 'running',
+            session_exists: true,
+          },
+        ],
+      },
+    ),
+  ).toBe(true)
+})
+
 test('bootstrap does not infer running from completed READY sessions', () => {
   expect(
     inferBootstrapStatus({
@@ -272,6 +341,151 @@ test('bootstrap ignores stale running runtime status on READY workers', () => {
       },
     }),
   ).toBe('ready')
+})
+
+test('bootstrap ignores terminal stale BUSY workers in overall review', () => {
+  const staleTerminalWorker = {
+    session_name: '需求分析师-地英星',
+    status: 'succeeded',
+    result_status: 'succeeded',
+    agent_state: 'BUSY',
+    health_status: 'alive',
+    current_task_runtime_status: 'done',
+    session_exists: true,
+  }
+  expect(
+    inferBootstrapStatus({
+      snapshots: {
+        app: {
+          active_stage: 'stage.a08.start',
+          pending_hitl: false,
+        },
+        stages: {
+          'overall-review': {
+            workers: [staleTerminalWorker],
+          },
+        },
+      },
+    }),
+  ).toBe('ready')
+  expect(
+    shouldRecoverRunningFromStageSnapshot(
+      'awaiting-input',
+      'stage.a08.start',
+      'overall-review',
+      { workers: [staleTerminalWorker] },
+      false,
+    ),
+  ).toBe(false)
+})
+
+test('bootstrap ignores old missing-session alive workers in overall review', () => {
+  const staleMissingSessionWorker = {
+    session_name: '需求分析师-地英星',
+    status: '',
+    agent_state: 'BUSY',
+    health_status: 'alive',
+    current_task_runtime_status: '',
+    session_exists: false,
+    updated_at: '2000-01-01T00:00:00Z',
+    last_heartbeat_at: '2000-01-01T00:00:00Z',
+  }
+  expect(
+    inferBootstrapStatus({
+      snapshots: {
+        app: {
+          active_stage: 'stage.a08.start',
+          pending_hitl: false,
+        },
+        stages: {
+          'overall-review': {
+            workers: [staleMissingSessionWorker],
+          },
+        },
+      },
+    }),
+  ).toBe('ready')
+  expect(
+    shouldRecoverRunningFromStageSnapshot(
+      'awaiting-input',
+      'stage.a08.start',
+      'overall-review',
+      { workers: [staleMissingSessionWorker] },
+      false,
+    ),
+  ).toBe(false)
+})
+
+test('bootstrap ignores terminal stale BUSY workers in requirements review', () => {
+  const staleTerminalWorker = {
+    session_name: '审核器-地进星',
+    status: 'succeeded',
+    result_status: 'succeeded',
+    agent_state: 'BUSY',
+    health_status: 'alive',
+    current_task_runtime_status: 'done',
+    session_exists: true,
+  }
+  expect(
+    inferBootstrapStatus({
+      snapshots: {
+        app: {
+          active_stage: 'stage.a04.start',
+          pending_hitl: false,
+        },
+        stages: {
+          review: {
+            workers: [staleTerminalWorker],
+          },
+        },
+      },
+    }),
+  ).toBe('ready')
+  expect(
+    shouldRecoverRunningFromStageSnapshot(
+      'awaiting-input',
+      'stage.a04.start',
+      'review',
+      { workers: [staleTerminalWorker] },
+      false,
+    ),
+  ).toBe(false)
+})
+
+test('bootstrap ignores terminal stale BUSY workers in detailed design', () => {
+  const staleTerminalWorker = {
+    session_name: '分析师-心月狐',
+    status: 'succeeded',
+    result_status: 'succeeded',
+    agent_state: 'BUSY',
+    health_status: 'alive',
+    current_task_runtime_status: 'done',
+    session_exists: true,
+  }
+  expect(
+    inferBootstrapStatus({
+      snapshots: {
+        app: {
+          active_stage: 'stage.a05.start',
+          pending_hitl: false,
+        },
+        stages: {
+          design: {
+            workers: [staleTerminalWorker],
+          },
+        },
+      },
+    }),
+  ).toBe('ready')
+  expect(
+    shouldRecoverRunningFromStageSnapshot(
+      'awaiting-input',
+      'stage.a05.start',
+      'design',
+      { workers: [staleTerminalWorker] },
+      false,
+    ),
+  ).toBe(false)
 })
 
 test('awaiting-input recovers when no prompt is pending and current snapshot has live workers', () => {

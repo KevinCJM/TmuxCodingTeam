@@ -1,3 +1,4 @@
+import { isBusyWorker } from './homeAgents'
 import type { WorkerSnapshot } from './types'
 import { stageBusyLabel as resolveStageBusyLabel, stageProgressKey } from './stageRegistry'
 
@@ -24,17 +25,6 @@ const STARTUP_PROGRESS_PATTERNS = [
   '配置审核器',
   '配置审核器模型',
 ] as const
-
-function isBusyWorker(worker: WorkerSnapshot): boolean {
-  const agentState = String(worker.agentState || '').trim().toUpperCase()
-  const status = String(worker.status || '').trim().toLowerCase()
-  const runtimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
-  if (['done', 'succeeded', 'completed'].includes(runtimeStatus)) return false
-  if (['done', 'succeeded', 'completed', 'ready', 'idle'].includes(status)) return false
-  if (agentState === 'BUSY') return true
-  if (agentState === 'READY' || agentState === 'STARTING' || agentState === 'DEAD') return false
-  return status === 'running' || runtimeStatus === 'running'
-}
 
 function stageWorkers(context: FooterProgressContext): WorkerSnapshot[] {
   switch (stageProgressKey(context.route, context.activeStage)) {

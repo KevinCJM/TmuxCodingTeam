@@ -835,18 +835,6 @@ def render_live_progress_line(
     selection,
     tick: int = 0,
 ) -> str:
-    for entry in run_store.manifest.workers:
-        state_path = str(getattr(entry, "state_path", "") or "").strip()
-        if not state_path:
-            continue
-        try:
-            run_store.update_worker_state_from_file(
-                entry.work_dir,
-                state_path,
-                preserve_workflow_fields=True,
-            )
-        except Exception:
-            continue
     counts = summarize_live_result_counts(run_store)
     spinner = TERMINAL_SPINNER_FRAMES[tick % len(TERMINAL_SPINNER_FRAMES)]
     entry_by_dir = {item.work_dir: item for item in run_store.manifest.workers}

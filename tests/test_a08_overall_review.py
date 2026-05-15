@@ -18,7 +18,9 @@ from A07_Development import (
 from A08_OverallReview import (
     OverallReviewStageResult,
     _build_overall_review_active_code_context,
+    _discover_overall_review_active_files,
     bind_reviewer_runtime_from_handoff,
+    build_overall_review_init_prompt,
     build_overall_review_reviewer_completion_contract,
     build_overall_review_metadata_repair_result_contract,
     build_overall_review_paths,
@@ -124,6 +126,113 @@ class A08OverallReviewTests(unittest.TestCase):
         self.assertEqual(phases, ["整体复核 / 配置最大审核轮次"])
         self.assertTrue(prompt_mock.call_args.kwargs["allow_back"])
         self.assertEqual(prompt_mock.call_args.kwargs["stage_key"], "overall_review")
+
+    def test_run_overall_review_stage_with_explicit_max_rounds_enters_first_review_without_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_overall_review_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewer_handoff = ReviewAgentHandoff(
+                reviewer_key="测试工程师",
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天英星"),
+            )
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                paths["merged_review_path"].write_text("", encoding="utf-8")
+                return True
+
+            with patch("A08_OverallReview.stdin_is_interactive", return_value=True), patch(
+                "A08_OverallReview.prompt_review_max_rounds",
+                side_effect=AssertionError("explicit --review-max-rounds should skip prompt"),
+            ), patch(
+                "A08_OverallReview._build_overall_review_active_code_context",
+                return_value="\n\n## cached active context\n- `src/app.py`\n",
+            ) as active_context_mock, patch(
+                "A08_OverallReview.build_overall_review_init_prompt",
+                wraps=build_overall_review_init_prompt,
+            ), patch(
+                "A08_OverallReview.initialize_overall_review_reviewers",
+                side_effect=lambda reviewers, **kwargs: list(reviewers),
+            ), patch(
+                "A08_OverallReview._run_parallel_overall_reviewers",
+                side_effect=lambda reviewers, **kwargs: list(reviewers),
+            ) as run_reviewers_mock, patch(
+                "A08_OverallReview.repair_overall_review_outputs",
+                side_effect=lambda reviewers, **kwargs: list(reviewers),
+            ), patch(
+                "A08_OverallReview.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A08_OverallReview._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_overall_review_stage(
+                    [
+                        "--project-dir",
+                        str(project_dir),
+                        "--requirement-name",
+                        "需求A",
+                        "--review-max-rounds",
+                        "5",
+                    ],
+                    developer_handoff=DevelopmentAgentHandoff(
+                        selection=developer.selection,
+                        role_prompt=developer.role_prompt,
+                        worker=developer.worker,
+                    ),
+                    reviewer_handoff=(reviewer_handoff,),
+                )
+
+        self.assertTrue(result.completed)
+        active_context_mock.assert_called_once()
+        run_reviewers_mock.assert_called_once()
+
+    def test_run_overall_review_stage_does_not_clear_previous_artifacts_before_agent_config(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_overall_review_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            paths["merged_review_path"].write_text("上一轮复核记录\n", encoding="utf-8")
+            review_md_path = project_dir / "需求A_整体代码复核记录_测试工程师.md"
+            review_json_path = project_dir / "需求A_整体复核记录_测试工程师.json"
+            review_md_path.write_text("上一轮 reviewer 输出\n", encoding="utf-8")
+            review_json_path.write_text(
+                json.dumps([{"task_name": "全面复核", "review_pass": False}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch("A08_OverallReview._build_overall_review_active_code_context", return_value=""), patch(
+                "A08_OverallReview.discover_live_development_handoffs",
+                return_value=(None, ()),
+            ), patch(
+                "A08_OverallReview.resolve_developer_plan",
+                side_effect=RuntimeError("等待开发工程师模型配置"),
+            ), patch(
+                "A08_OverallReview.cleanup_existing_overall_review_artifacts",
+                side_effect=AssertionError("cleanup should wait until agent config is ready"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "等待开发工程师模型配置"):
+                    run_overall_review_stage(["--project-dir", str(project_dir), "--requirement-name", "需求A"])
+
+            self.assertEqual(paths["merged_review_path"].read_text(encoding="utf-8"), "上一轮复核记录\n")
+            self.assertTrue(review_md_path.exists())
+            self.assertTrue(review_json_path.exists())
 
     def test_build_overall_review_reviewer_completion_contract_uses_a08_semantics(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -248,6 +357,87 @@ class A08OverallReviewTests(unittest.TestCase):
 
         self.assertIn("text_stats.py", context)
         self.assertIn("不能仅凭 `repo_map.json`", context)
+
+    def test_active_code_context_prunes_vendor_data_and_runtime_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            (project_dir / "docs").mkdir()
+            (project_dir / "docs" / "repo_map.json").write_text(
+                json.dumps(
+                    {
+                        "modules": [
+                            {
+                                "owned_paths": [
+                                    {"path": ".venv/lib/python3.12/site-packages/PIL"},
+                                    {"path": "data"},
+                                    {"path": ".development_runtime"},
+                                    {"path": "src"},
+                                    {"path": "configs"},
+                                    {"path": "scripts"},
+                                    {"path": "tests"},
+                                ]
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            for rel_path, content in {
+                ".venv/lib/python3.12/site-packages/PIL/Image.py": "vendor\n",
+                "data/all_metrics_features.parquet": "binary\n",
+                ".development_runtime/需求/worker.raw.log": "log\n",
+                ".detailed_design_runtime/需求/worker.raw.log": "log\n",
+                "logs/runtime.log": "log\n",
+                "src/app.py": "print('ok')\n",
+                "src/data/loader.py": "print('source data loader')\n",
+                "configs/main.yaml": "ok: true\n",
+                "scripts/run.sh": "python src/app.py\n",
+                "tests/test_app.py": "def test_ok(): pass\n",
+            }.items():
+                path = project_dir / rel_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+
+            files = _discover_overall_review_active_files(project_dir, limit=20)
+            context = _build_overall_review_active_code_context(project_dir)
+
+        self.assertIn("src/app.py", files)
+        self.assertIn("src/data/loader.py", files)
+        self.assertIn("configs/main.yaml", files)
+        self.assertIn("scripts/run.sh", files)
+        self.assertIn("tests/test_app.py", files)
+        for forbidden in (
+            ".venv",
+            "site-packages",
+            ".parquet",
+            "worker.raw.log",
+            ".development_runtime",
+            ".detailed_design_runtime",
+            "`data/",
+            "`logs/",
+        ):
+            self.assertNotIn(forbidden, context)
+
+    def test_build_overall_review_init_prompt_reuses_cached_active_context(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_overall_review_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            cached_context = "\n\n## cached active context\n- `src/app.py`\n"
+
+            with patch(
+                "A08_OverallReview._build_overall_review_active_code_context",
+                side_effect=AssertionError("active context should be passed in by caller"),
+            ):
+                prompt = build_overall_review_init_prompt(
+                    paths,
+                    project_dir=project_dir,
+                    active_code_context=cached_context,
+                )
+
+        self.assertIn("## cached active context", prompt)
+        self.assertIn("src/app.py", prompt)
 
     def test_shutdown_overall_review_workers_removes_requirement_scoped_runtime(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -461,6 +651,8 @@ class A08OverallReviewTests(unittest.TestCase):
             self.assertTrue(result.completed)
             self.assertTrue(json.loads(Path(result.state_path).read_text(encoding="utf-8"))["passed"])
             create_developer_runtime_mock.assert_not_called()
+            self.assertEqual(developer.worker.metadata_updates[-1]["workflow_action"], "stage.a08.start")
+            self.assertEqual(reviewer_worker.metadata_updates[-1]["workflow_action"], "stage.a08.start")
 
     def test_run_overall_review_stage_creates_developer_after_failed_review(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

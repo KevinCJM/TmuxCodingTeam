@@ -3,7 +3,13 @@ import { useKeyboard, useRenderer, useTerminalDimensions } from '@opentui/solid'
 import { Match, Switch, createEffect, createMemo, createSignal, onCleanup, onMount, Show, For } from 'solid-js'
 import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
-import { BackendClient, type BackendEvent } from './backend/client'
+import {
+  BackendClient,
+  runCleanupOnlyBackend,
+  type BackendCleanupContext,
+  type BackendEvent,
+  type BackendStopOptions,
+} from './backend/client'
 import { copyToClipboard } from './clipboard'
 import {
   appendEntryWithMerge,
@@ -26,6 +32,7 @@ import { ControlRoute } from './routes/ControlRoute'
 import { resolveFooterProgressLine } from './footerProgress'
 import { buildHomeAgents } from './homeAgents'
 import { promptAllowsBack, resolvePromptBackValue, withPromptBackOption } from './promptBack'
+import { promptStateFromSnapshot } from './promptSnapshot'
 import { resolvePromptResponseTransition } from './promptTransition'
 import {
   applyStageChanged,
@@ -121,6 +128,8 @@ const EMPTY_APP_SNAPSHOT: AppSnapshot = {
   currentAction: '',
   activeRunId: '',
   activeStage: 'idle',
+  activeStageStatus: 'ready',
+  activeStageSeq: 0,
   activeStageLabel: '等待中',
   pendingHitl: false,
   pendingAttention: false,
@@ -200,6 +209,8 @@ const EMPTY_HITL_SNAPSHOT: HitlSnapshot = {
 const EMPTY_ARTIFACTS_SNAPSHOT: ArtifactsSnapshot = {
   items: [],
 }
+
+let latestBackendCleanupContext: BackendCleanupContext = { projectDir: '' }
 
 function logEntryPalette(kind: LogKind, hitlRound?: number) {
   if (kind === 'hitl') {
@@ -670,6 +681,7 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
     workDir: String(value.work_dir ?? value.workDir ?? ''),
     sessionName: String(value.session_name ?? value.sessionName ?? ''),
     status: String(value.status ?? ''),
+    resultStatus: String(value.result_status ?? value.resultStatus ?? ''),
     workflowStage: String(value.workflow_stage ?? value.workflowStage ?? ''),
     agentState: String(value.agent_state ?? value.agentState ?? ''),
     healthStatus: String(value.health_status ?? value.healthStatus ?? ''),
@@ -840,6 +852,8 @@ function normalizeAppSnapshot(payload: Record<string, unknown>): AppSnapshot {
     currentAction: String(payload.current_action ?? payload.currentAction ?? ''),
     activeRunId: String(payload.active_run_id ?? payload.activeRunId ?? ''),
     activeStage: String(payload.active_stage ?? payload.activeStage ?? 'idle'),
+    activeStageStatus: String(payload.active_stage_status ?? payload.activeStageStatus ?? ''),
+    activeStageSeq: Number(payload.active_stage_seq ?? payload.activeStageSeq ?? 0),
     activeStageLabel: String(payload.active_stage_label ?? payload.activeStageLabel ?? '等待中'),
     pendingHitl: Boolean(payload.pending_hitl ?? payload.pendingHitl),
     pendingAttention: Boolean(payload.pending_attention ?? payload.pendingAttention),
@@ -900,8 +914,16 @@ async function runInheritedCommand(renderer: ReturnType<typeof useRenderer>, com
 
 const client = new BackendClient()
 
-export function stopBackendClient(forceKillAfterMs?: number) {
-  return client.stop(forceKillAfterMs)
+export function stopBackendClient(options?: BackendStopOptions) {
+  return client.stop(options)
+}
+
+export function getLatestBackendCleanupContext(): BackendCleanupContext {
+  return { ...latestBackendCleanupContext }
+}
+
+export function runBackendCleanupFallback(context: BackendCleanupContext) {
+  return runCleanupOnlyBackend(context)
 }
 
 export function App(props: StartupOptions) {
@@ -932,9 +954,19 @@ export function App(props: StartupOptions) {
   const displayAppSnapshot = createMemo<AppSnapshot>(() => {
     const base = appSnapshot()
     const visibleHitl = displayHitlSnapshot()
+    const visibleAttention = buildPromptBackedAttentionSnapshot(prompt(), base)
     return {
       ...base,
       pendingHitl: visibleHitl.pending || (base.pendingHitl && status() === 'awaiting-input'),
+      ...visibleAttention,
+    }
+  })
+  createEffect(() => {
+    const snapshot = displayAppSnapshot()
+    latestBackendCleanupContext = {
+      projectDir: String(snapshot.projectDir || '').trim(),
+      requirementName: String(snapshot.requirementName || '').trim(),
+      action: String(snapshot.currentAction || snapshot.activeStage || '').trim(),
     }
   })
   const homeAgents = createMemo<HomeAgentItem[]>(() =>
@@ -1153,6 +1185,12 @@ export function App(props: StartupOptions) {
 
   const applyBootstrapSnapshots = (payload: Record<string, unknown>) => {
     const snapshots = (payload.snapshots as Record<string, unknown>) ?? {}
+    const restoredPrompt = promptStateFromSnapshot(snapshots.prompt, buildPromptDraftKey)
+    if (restoredPrompt) {
+      const nextFocus = isOverlayPromptType(restoredPrompt.promptType) ? 'dialog' : 'prompt'
+      setPrompt(restoredPrompt)
+      setShellFocus(nextFocus)
+    }
     if (snapshots.app && typeof snapshots.app === 'object') setAppSnapshot(normalizeAppSnapshot(snapshots.app as Record<string, unknown>))
     if (snapshots.stages && typeof snapshots.stages === 'object') {
       const stageSnapshots = snapshots.stages as Record<string, unknown>
@@ -1270,7 +1308,7 @@ export function App(props: StartupOptions) {
       if (stageRoute === 'development') setDevelopmentSnapshot(normalizeDevelopmentSnapshot(stageSnapshot))
       if (stageRoute === 'overall-review') setOverallReviewSnapshot(normalizeOverallReviewSnapshot(stageSnapshot))
       const activeStage = displayAppSnapshot().activeStage !== 'idle' ? displayAppSnapshot().activeStage : stageCursor().activeAction
-      const hasPendingInput = Boolean(prompt()) || Boolean(hitlSnapshot().pending)
+      const hasPendingInput = Boolean(prompt()) || Boolean(hitlSnapshot().pending) || Boolean(displayAppSnapshot().pendingAttention)
       if (shouldRecoverRunningFromStageSnapshot(status(), activeStage, stageRoute, stageSnapshot, hasPendingInput)) {
         setStatus('running')
       }

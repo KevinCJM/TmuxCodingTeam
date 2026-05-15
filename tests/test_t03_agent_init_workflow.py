@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from T02_tmux_agents import AgentRunConfig, AgentRuntimeState, CommandResult, WorkerResult
 from T03_agent_init_workflow import (
@@ -1181,6 +1184,45 @@ class AgentInitWorkflowTests(unittest.TestCase):
             self.assertEqual(manifest["workers"][0]["work_dir"], str(project_dir))
             self.assertEqual(manifest["workers"][0]["result_status"], "pending")
             self.assertEqual(manifest["workers"][0]["agent_state"], AgentRuntimeState.STARTING.value)
+
+    def test_run_store_write_manifest_allows_concurrent_loaded_instances(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            selection = resolve_target_selection(project_dir=project_dir, run_init=True)
+            config = AgentRunConfig(vendor="codex", model="gpt-5")
+            store = RunStore.create(
+                selection=selection,
+                config=config,
+                runtime_root=Path(tmpdir) / "runtime",
+                run_id="run_demo",
+            )
+            loaded_stores = [
+                RunStore.load(run_id=store.manifest.run_id, runtime_root=Path(tmpdir) / "runtime"),
+                RunStore.load(run_id=store.manifest.run_id, runtime_root=Path(tmpdir) / "runtime"),
+            ]
+            original_write_text = Path.write_text
+            write_barrier = threading.Barrier(2)
+
+            def delayed_write_text(path, data, *args, **kwargs):  # noqa: ANN001
+                result = original_write_text(path, data, *args, **kwargs)
+                if str(Path(path).name).startswith("manifest.json.tmp."):
+                    write_barrier.wait(timeout=5.0)
+                return result
+
+            def write_loaded_store(index: int) -> Path:
+                loaded_stores[index].manifest.status = f"running-{index}"
+                return loaded_stores[index].write_manifest()
+
+            with patch.object(Path, "write_text", delayed_write_text):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(write_loaded_store, index) for index in range(2)]
+                    for future in futures:
+                        self.assertEqual(future.result(timeout=5), store.manifest_path)
+
+            payload = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+            self.assertIn(payload["status"], {"running-0", "running-1"})
+            self.assertFalse(list(store.run_root.glob("manifest.json.tmp.*")))
 
     def test_run_store_preserves_active_prelaunch_starting_from_dead_state_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:

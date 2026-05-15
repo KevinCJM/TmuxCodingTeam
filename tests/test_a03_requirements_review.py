@@ -42,6 +42,7 @@ from T08_pre_development import (
     build_pre_development_task_record_path,
     ensure_pre_development_task_record,
 )
+from tmux_core.runtime.contracts import TASK_STATUS_DONE, TASK_STATUS_RUNNING, read_task_status, write_task_status
 from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 
 
@@ -2084,6 +2085,99 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 )
 
             self.assertIs(result, reviewer)
+
+    def test_run_reviewer_turn_with_recreation_marks_valid_materialized_outputs_succeeded(self):
+        class StatefulFakeWorker(_FakeWorker):
+            def __init__(self, *, task_status_path: Path, **kwargs):
+                super().__init__(**kwargs)
+                self.state: dict[str, object] = {
+                    "status": "running",
+                    "result_status": "running",
+                    "agent_state": "BUSY",
+                    "current_task_status_path": str(task_status_path),
+                    "current_task_runtime_status": TASK_STATUS_RUNNING,
+                    "current_turn_id": "requirements_review_R1",
+                    "current_turn_phase": REQUIREMENTS_REVIEW_TASK_NAME,
+                }
+                self.recorded_results: list[object] = []
+
+            def read_state(self):
+                return dict(self.state)
+
+            def _record_result(self, result, *, status, note, extra=None):  # noqa: ANN001
+                self.recorded_results.append(result)
+                self.state.update(
+                    {
+                        "status": str(getattr(status, "value", status)),
+                        "note": note,
+                    }
+                )
+                self.state.update(dict(extra or {}))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            task_status_path = root / "task.status.json"
+            write_task_status(task_status_path, status=TASK_STATUS_RUNNING)
+            review_md_path, review_json_path = build_reviewer_artifact_paths(root, "需求A", "R1")
+            review_md_path.write_text("", encoding="utf-8")
+            review_json_path.write_text("[]", encoding="utf-8")
+            worker = StatefulFakeWorker(
+                task_status_path=task_status_path,
+                runtime_root=root / ".requirements_review_runtime",
+                runtime_dir=root / ".requirements_review_runtime" / "worker",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="R1",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=worker,
+                review_md_path=review_md_path,
+                review_json_path=review_json_path,
+                contract=build_reviewer_completion_contract(
+                    requirement_name="需求A",
+                    reviewer_name="R1",
+                    review_md_path=review_md_path,
+                    review_json_path=review_json_path,
+                ),
+            )
+
+            def fake_run_reviewer_turn(reviewer, *, label, prompt):  # noqa: ANN001
+                _ = label, prompt
+                reviewer.review_md_path.write_text("仍缺少独立部署边界说明\n", encoding="utf-8")
+                reviewer.review_json_path.write_text(
+                    json.dumps(
+                        [{"task_name": REQUIREMENTS_REVIEW_TASK_NAME, "review_pass": False}],
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                reviewer.worker.state.update(
+                    {
+                        "status": "failed",
+                        "result_status": "failed",
+                        "agent_state": "READY",
+                        "current_task_runtime_status": "",
+                    }
+                )
+
+            with patch("A03_RequirementsReview._run_reviewer_turn", side_effect=fake_run_reviewer_turn):
+                result = run_reviewer_turn_with_recreation(
+                    reviewer,
+                    project_dir=root,
+                    requirement_name="需求A",
+                    label="requirements_review_init_R1_round_1",
+                    prompt="do review",
+                )
+
+            state = worker.read_state()
+            task_runtime_status = read_task_status(task_status_path)
+
+        self.assertIs(result, reviewer)
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(state["result_status"], "succeeded")
+        self.assertEqual(state["agent_state"], "READY")
+        self.assertEqual(state["current_task_runtime_status"], TASK_STATUS_DONE)
+        self.assertEqual(task_runtime_status, TASK_STATUS_DONE)
+        self.assertEqual(worker.recorded_results[-1].label, "requirements_review_init_R1_round_1")
 
     def test_run_reviewer_turn_with_recreation_rebuilds_auth_failed_reviewer_with_new_model(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
@@ -266,10 +267,30 @@ class T09TerminalOpsTests(unittest.TestCase):
         with use_terminal_ui(ui):
             self.assertTrue(terminal_ui_is_interactive())
 
-    def test_stdio_attach_external_process_returns_130_on_keyboard_interrupt(self):
+    def test_stdio_attach_external_process_waits_for_child_shutdown_after_keyboard_interrupt(self):
         ui = StdioTerminalUI()
-        with patch("T09_terminal_ops.subprocess.run", side_effect=KeyboardInterrupt):
+        child = Mock()
+        child.wait.side_effect = [KeyboardInterrupt(), 0]
+        with patch("T09_terminal_ops.subprocess.Popen", return_value=child):
             self.assertEqual(ui.attach_external_process(["bun", "run"]), 130)
+        child.send_signal.assert_called_once()
+        child.terminate.assert_not_called()
+        child.kill.assert_not_called()
+
+    def test_stdio_attach_external_process_escalates_to_sigterm_and_sigkill_when_child_hangs(self):
+        ui = StdioTerminalUI()
+        child = Mock()
+        child.wait.side_effect = [
+            KeyboardInterrupt(),
+            subprocess.TimeoutExpired(cmd=["bun", "run"], timeout=30.0),
+            subprocess.TimeoutExpired(cmd=["bun", "run"], timeout=10.0),
+            0,
+        ]
+        with patch("T09_terminal_ops.subprocess.Popen", return_value=child):
+            self.assertEqual(ui.attach_external_process(["bun", "run"]), 130)
+        child.send_signal.assert_called_once()
+        child.terminate.assert_called_once_with()
+        child.kill.assert_called_once_with()
 
     def test_maybe_launch_tui_falls_back_to_legacy_when_help_requested(self):
         redirected, payload = maybe_launch_tui(["--help"], route="home", action="workflow.a00.start")

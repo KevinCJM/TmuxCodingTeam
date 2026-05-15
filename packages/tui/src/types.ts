@@ -12,6 +12,7 @@ export type WorkerSnapshot = {
   workDir: string
   sessionName: string
   status: string
+  resultStatus?: string
   workflowStage: string
   agentState: string
   healthStatus: string
@@ -161,6 +162,8 @@ export type AppSnapshot = {
   currentAction: string
   activeRunId: string
   activeStage: string
+  activeStageStatus: string
+  activeStageSeq: number
   activeStageLabel: string
   pendingHitl: boolean
   pendingAttention: boolean

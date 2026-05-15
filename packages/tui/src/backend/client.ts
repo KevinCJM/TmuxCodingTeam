@@ -13,10 +13,27 @@ type BackendEnvelope = {
 }
 
 const BACKEND_STOP_KILL_GRACE_MS = 10000
+const BACKEND_CLEANUP_ONLY_EXIT_TIMEOUT_MS = 30000
 
 export type BackendEvent = {
   type: string
   payload: Record<string, unknown>
+}
+
+export type BackendStopOptions = {
+  forceKillAfterMs?: number
+  reason?: 'normal' | 'signal'
+}
+
+export type BackendStopResult = {
+  graceful: boolean
+  signalEscalatedToSigkill: boolean
+}
+
+export type BackendCleanupContext = {
+  projectDir: string
+  requirementName?: string
+  action?: string
 }
 
 export function repoRoot() {
@@ -33,10 +50,50 @@ export function readPythonPath() {
   return String(match[1])
 }
 
+export async function runCleanupOnlyBackend(context: BackendCleanupContext): Promise<boolean> {
+  const projectDir = String(context.projectDir || '').trim()
+  if (!projectDir) return false
+  const python = readPythonPath()
+  const backendPath = join(repoRoot(), 'T11_tui_backend.py')
+  const command = [python, backendPath, '--cleanup-project-dir', projectDir]
+  const requirementName = String(context.requirementName || '').trim()
+  const action = String(context.action || '').trim()
+  if (requirementName) {
+    command.push('--cleanup-requirement-name', requirementName)
+  }
+  if (action) {
+    command.push('--cleanup-action', action)
+  }
+  const child = Bun.spawn(command, {
+    cwd: repoRoot(),
+    stdin: 'ignore',
+    stdout: 'inherit',
+    stderr: 'inherit',
+    env: process.env,
+  })
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<number>((resolve) => {
+    timeoutId = setTimeout(() => resolve(124), BACKEND_CLEANUP_ONLY_EXIT_TIMEOUT_MS)
+  })
+  const exitCode = await Promise.race([
+    Promise.resolve(child.exited).then((code) => Number(code ?? 0), () => 1),
+    timeout,
+  ])
+  if (timeoutId) clearTimeout(timeoutId)
+  if (exitCode === 124) {
+    try {
+      child.kill('SIGKILL')
+    } catch {
+      // Child already exited.
+    }
+  }
+  return exitCode === 0
+}
+
 export class BackendClient {
   private process?: Bun.Subprocess<'pipe', 'pipe', 'pipe'>
   private stoppingProcess?: Bun.Subprocess<'pipe', 'pipe', 'pipe'>
-  private stoppingPromise?: Promise<void>
+  private stoppingPromise?: Promise<BackendStopResult>
   private processExitHandler?: () => void
   private nextId = 1
   private buffer = ''
@@ -79,7 +136,9 @@ export class BackendClient {
     this.processExitHandler = undefined
   }
 
-  async stop(forceKillAfterMs = BACKEND_STOP_KILL_GRACE_MS) {
+  async stop(options: BackendStopOptions = {}): Promise<BackendStopResult> {
+    const forceKillAfterMs = options.forceKillAfterMs ?? BACKEND_STOP_KILL_GRACE_MS
+    void options.reason
     const pending = [...this.pending.values()]
     this.pending.clear()
     for (const waiter of pending) {
@@ -89,12 +148,11 @@ export class BackendClient {
     const child = this.process
     this.process = undefined
     if (!child) {
-      if (this.stoppingPromise) await this.stoppingPromise
-      return
+      if (this.stoppingPromise) return await this.stoppingPromise
+      return { graceful: true, signalEscalatedToSigkill: false }
     }
     if (this.stoppingProcess === child && this.stoppingPromise) {
-      await this.stoppingPromise
-      return
+      return await this.stoppingPromise
     }
     this.stoppingProcess = child
     try {
@@ -102,30 +160,41 @@ export class BackendClient {
     } catch {
       this.stoppingProcess = undefined
       this.clearProcessExitHandlerIfIdle()
-      return
+      return { graceful: true, signalEscalatedToSigkill: false }
     }
     const exited = child.exited
     if (!exited || typeof exited.finally !== 'function') {
       this.stoppingProcess = undefined
       this.clearProcessExitHandlerIfIdle()
-      return
+      return { graceful: true, signalEscalatedToSigkill: false }
     }
+    let signalEscalatedToSigkill = false
     const timer = setTimeout(() => {
       if (this.stoppingProcess !== child) return
       try {
+        signalEscalatedToSigkill = true
         child.kill('SIGKILL')
       } catch {
         // Process is already gone.
       }
     }, Math.max(0, forceKillAfterMs))
-    const stopPromise: Promise<void> = Promise.resolve(exited).then(() => undefined, () => undefined).finally(() => {
+    const stopPromise: Promise<BackendStopResult> = Promise.resolve(exited).then(
+      () => ({
+        graceful: !signalEscalatedToSigkill,
+        signalEscalatedToSigkill,
+      }),
+      () => ({
+        graceful: !signalEscalatedToSigkill,
+        signalEscalatedToSigkill,
+      }),
+    ).finally(() => {
       if (timer) clearTimeout(timer)
       if (this.stoppingProcess === child) this.stoppingProcess = undefined
       if (this.stoppingPromise === stopPromise) this.stoppingPromise = undefined
       this.clearProcessExitHandlerIfIdle()
     })
     this.stoppingPromise = stopPromise
-    await this.stoppingPromise
+    return await this.stoppingPromise
   }
 
   private async consumeStderr(stream: ReadableStream<Uint8Array>) {

@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { BackendClient, readPythonPath, repoRoot } from './client'
+import { BackendClient, readPythonPath, repoRoot, runCleanupOnlyBackend } from './client'
 
 test('BackendClient can be constructed', () => {
   const client = new BackendClient()
@@ -45,9 +45,10 @@ test('BackendClient stop tears down child process and completes pending requests
   })
   client.subscribe(() => undefined)
 
-  await client.stop()
+  const result = await client.stop()
 
   expect(signals).toEqual(['SIGTERM'])
+  expect(result).toEqual({ graceful: true, signalEscalatedToSigkill: false })
   expect(resolved).toBe(true)
   expect(client.process).toBeUndefined()
   expect(client.pending.size).toBe(0)
@@ -68,7 +69,8 @@ test('BackendClient stop waits for backend exit before completing', async () => 
   }
 
   let stopped = false
-  const stopping = client.stop(50).then(() => {
+  const stopping = client.stop({ forceKillAfterMs: 50 }).then((result: { graceful: boolean }) => {
+    expect(result.graceful).toBe(true)
     stopped = true
   })
   await Promise.resolve()
@@ -86,17 +88,25 @@ test('BackendClient stop waits for backend exit before completing', async () => 
 test('BackendClient stop escalates to SIGKILL when backend does not exit', async () => {
   const client = new BackendClient() as any
   const signals: string[] = []
+  let resolveExited!: () => void
   client.process = {
     kill: (signal?: string) => {
       signals.push(signal || '')
+      if (signal === 'SIGKILL') resolveExited()
     },
-    exited: new Promise(() => undefined),
+    exited: new Promise<void>((resolve) => {
+      resolveExited = resolve
+    }),
   }
 
-  client.stop(1)
-  await new Promise((resolve) => setTimeout(resolve, 5))
+  let result: { graceful: boolean; signalEscalatedToSigkill: boolean } | undefined
+  const stopping = client.stop({ forceKillAfterMs: 1, reason: 'signal' }).then((value: { graceful: boolean; signalEscalatedToSigkill: boolean }) => {
+    result = value
+  })
+  await stopping
 
   expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+  expect(result).toEqual({ graceful: false, signalEscalatedToSigkill: true })
   client.stoppingProcess = undefined
   client.clearProcessExitHandlerIfIdle()
 })
@@ -116,4 +126,9 @@ test('BackendClient process exit fallback sends SIGTERM only', () => {
   client.clearProcessExitHandlerIfIdle()
 
   expect(signals).toEqual(['SIGTERM'])
+})
+
+test('cleanup-only backend runner skips spawn when project dir is missing', async () => {
+  const ok = await runCleanupOnlyBackend({ projectDir: '' })
+  expect(ok).toBe(false)
 })

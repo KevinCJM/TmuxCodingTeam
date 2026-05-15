@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -1003,15 +1004,161 @@ _OVERALL_REVIEW_ACTIVE_CODE_SUFFIXES = {
 }
 
 _OVERALL_REVIEW_CONTEXT_EXCLUDED_DIRS = {
+    ".detailed_design_runtime",
     ".development_runtime",
+    ".pytest_cache",
+    ".requirements_clarification_runtime",
+    ".requirements_review_runtime",
     ".routing_init_runtime",
+    ".task_split_runtime",
     ".tmux_stage_locks",
     ".tmux_workflow",
+    ".venv",
     ".git",
     "__pycache__",
-    "docs",
     "node_modules",
+    "venv",
 }
+_OVERALL_REVIEW_CONTEXT_ROOT_EXCLUDED_DIRS = {"data", "docs", "logs", "vendor"}
+
+_OVERALL_REVIEW_DEFAULT_CONTEXT_DIRS = ("src", "tests", "configs", "scripts")
+_OVERALL_REVIEW_ROOT_CONTEXT_FILES = (
+    "AGENTS.md",
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+    "setup.cfg",
+    "tox.ini",
+    "pytest.ini",
+    "mypy.ini",
+    "package.json",
+    "tsconfig.json",
+)
+
+
+def _overall_review_rel_is_excluded(rel_path: Path) -> bool:
+    parts = rel_path.parts
+    if not parts:
+        return False
+    if parts[0] in _OVERALL_REVIEW_CONTEXT_ROOT_EXCLUDED_DIRS:
+        return True
+    return any(part in _OVERALL_REVIEW_CONTEXT_EXCLUDED_DIRS for part in parts)
+
+
+def _overall_review_rel_is_active_file(rel_path: Path) -> bool:
+    if _overall_review_rel_is_excluded(rel_path):
+        return False
+    if rel_path.suffix.lower() not in _OVERALL_REVIEW_ACTIVE_CODE_SUFFIXES:
+        return False
+    if rel_path.name.startswith(".") and rel_path.suffix.lower() not in {".toml", ".yaml", ".yml"}:
+        return False
+    return True
+
+
+def _safe_repo_map_ref(value: object) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    rel = Path(text)
+    if rel.is_absolute() or any(part == ".." for part in rel.parts):
+        return None
+    if _overall_review_rel_is_excluded(rel):
+        return None
+    return rel
+
+
+def _repo_map_owned_path_refs(project_root: Path) -> tuple[Path, ...]:
+    repo_map_path = project_root / "docs" / "repo_map.json"
+    if not repo_map_path.exists() or not repo_map_path.is_file():
+        return ()
+    try:
+        payload = json.loads(repo_map_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ()
+    refs: list[Path] = []
+    modules = payload.get("modules", [])
+    if not isinstance(modules, list):
+        return ()
+    for module in modules:
+        if not isinstance(module, dict):
+            continue
+        owned_paths = module.get("owned_paths", [])
+        if not isinstance(owned_paths, list):
+            continue
+        for item in owned_paths:
+            if not isinstance(item, dict):
+                continue
+            rel = _safe_repo_map_ref(item.get("ref") or item.get("path"))
+            if rel is not None:
+                refs.append(rel)
+    return tuple(dict.fromkeys(refs))
+
+
+def _overall_review_context_seed_paths(project_root: Path) -> tuple[Path, ...]:
+    seeds: list[Path] = []
+    seeds.extend(_repo_map_owned_path_refs(project_root))
+    seeds.extend(Path(item) for item in _OVERALL_REVIEW_DEFAULT_CONTEXT_DIRS)
+    seeds.extend(Path(item) for item in _OVERALL_REVIEW_ROOT_CONTEXT_FILES)
+    return tuple(dict.fromkeys(seed for seed in seeds if not _overall_review_rel_is_excluded(seed)))
+
+
+def _iter_root_active_files(project_root: Path):
+    try:
+        with os.scandir(project_root) as entries_iter:
+            entries = sorted(entries_iter, key=lambda entry: entry.name)
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            rel = Path(entry.name)
+            if _overall_review_rel_is_active_file(rel):
+                yield rel
+        except OSError:
+            continue
+
+
+def _iter_active_files_under_seed(project_root: Path, seed: Path):
+    target = project_root / seed
+    if not target.exists():
+        return
+    if target.is_file():
+        try:
+            rel = target.relative_to(project_root)
+        except ValueError:
+            return
+        if _overall_review_rel_is_active_file(rel):
+            yield rel
+        return
+    if not target.is_dir():
+        return
+    pending = [target]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries_iter:
+                entries = sorted(entries_iter, key=lambda entry: entry.name)
+        except OSError:
+            continue
+        dirs: list[Path] = []
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                rel = path.relative_to(project_root)
+            except ValueError:
+                continue
+            if _overall_review_rel_is_excluded(rel):
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    dirs.append(path)
+                    continue
+                if entry.is_file(follow_symlinks=False) and _overall_review_rel_is_active_file(rel):
+                    yield rel
+            except OSError:
+                continue
+        pending.extend(reversed(dirs))
 
 
 def _discover_overall_review_active_files(project_dir: str | Path, *, limit: int = 40) -> tuple[str, ...]:
@@ -1019,22 +1166,19 @@ def _discover_overall_review_active_files(project_dir: str | Path, *, limit: int
     if not root.exists():
         return ()
     discovered: list[str] = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        try:
-            rel = path.relative_to(root)
-        except ValueError:
-            continue
-        if any(part in _OVERALL_REVIEW_CONTEXT_EXCLUDED_DIRS for part in rel.parts):
-            continue
-        if path.suffix.lower() not in _OVERALL_REVIEW_ACTIVE_CODE_SUFFIXES:
-            continue
-        if rel.name.startswith(".") and rel.suffix.lower() not in {".toml", ".yaml", ".yml"}:
-            continue
-        discovered.append(rel.as_posix())
-        if len(discovered) >= limit:
-            break
+    seen: set[str] = set()
+    for rel_iter in (
+        _iter_root_active_files(root),
+        *(_iter_active_files_under_seed(root, seed) for seed in _overall_review_context_seed_paths(root)),
+    ):
+        for rel in rel_iter:
+            text = rel.as_posix()
+            if text in seen:
+                continue
+            seen.add(text)
+            discovered.append(text)
+            if len(discovered) >= limit:
+                return tuple(discovered)
     return tuple(discovered)
 
 
@@ -1058,7 +1202,23 @@ def _build_overall_review_active_code_context(project_dir: str | Path) -> str:
     )
 
 
-def build_overall_review_init_prompt(paths: dict[str, Path], *, project_dir: str | Path | None = None) -> str:
+def _resolve_overall_review_active_code_context(
+    project_dir: str | Path | None,
+    active_code_context: str | None = None,
+) -> str:
+    if active_code_context is not None:
+        return active_code_context
+    if project_dir is None:
+        return ""
+    return _build_overall_review_active_code_context(project_dir)
+
+
+def build_overall_review_init_prompt(
+    paths: dict[str, Path],
+    *,
+    project_dir: str | Path | None = None,
+    active_code_context: str | None = None,
+) -> str:
     prompt = init_reviewer(
         hitl_record_md=str(paths["hitl_record_path"].resolve()),
         requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
@@ -1066,8 +1226,7 @@ def build_overall_review_init_prompt(paths: dict[str, Path], *, project_dir: str
         detailed_design_md=str(paths["detailed_design_path"].resolve()),
         task_split_md=str(paths["task_md_path"].resolve()),
     )
-    if project_dir is not None:
-        prompt += _build_overall_review_active_code_context(project_dir)
+    prompt += _resolve_overall_review_active_code_context(project_dir, active_code_context)
     return prompt
 
 
@@ -1176,6 +1335,7 @@ def initialize_overall_review_developer(
     requirement_name: str,
     paths: dict[str, Path],
     progress: ReviewStageProgress | None = None,
+    active_code_context: str | None = None,
 ) -> DeveloperRuntime:
     if progress is not None:
         progress.set_phase("复核阶段 / 初始化开发工程师")
@@ -1184,7 +1344,11 @@ def initialize_overall_review_developer(
         project_dir=project_dir,
         requirement_name=requirement_name,
         label="overall_review_developer_init",
-        prompt=build_overall_review_init_prompt(paths, project_dir=project_dir),
+        prompt=build_overall_review_init_prompt(
+            paths,
+            project_dir=project_dir,
+            active_code_context=active_code_context,
+        ),
         result_contract=build_overall_review_init_result_contract(paths, mode="a08_developer_init"),
         paths=paths,
         progress=progress,
@@ -1272,6 +1436,7 @@ def _run_single_overall_review_reviewer_init(
     paths: dict[str, Path],
     reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
     progress: ReviewStageProgress | None = None,
+    active_code_context: str | None = None,
 ) -> ReviewerRuntime | None:
     init_contract = build_overall_review_init_result_contract(paths, mode="a08_reviewer_init")
     current_reviewer = reviewer
@@ -1286,7 +1451,11 @@ def _run_single_overall_review_reviewer_init(
             run_task_result_turn_with_repair(
                 worker=current_reviewer.worker,
                 label=f"overall_review_reviewer_init_{sanitize_requirement_name(current_reviewer.reviewer_name)}",
-                prompt=build_overall_review_init_prompt(paths, project_dir=project_dir),
+                prompt=build_overall_review_init_prompt(
+                    paths,
+                    project_dir=project_dir,
+                    active_code_context=active_code_context,
+                ),
                 result_contract=init_contract,
                 parse_result_payload=_parse_lenient_result_payload,
                 turn_goal=build_overall_review_turn_goal(mode=init_contract.mode, paths=paths),
@@ -1389,6 +1558,7 @@ def initialize_overall_review_reviewers(
     paths: dict[str, Path],
     reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
     progress: ReviewStageProgress | None = None,
+    active_code_context: str | None = None,
 ) -> list[ReviewerRuntime]:
     if progress is not None:
         progress.set_phase("复核阶段 / 初始化审核器")
@@ -1402,6 +1572,7 @@ def initialize_overall_review_reviewers(
             paths=paths,
             reviewer_specs_by_name=reviewer_specs_by_name,
             progress=progress,
+            active_code_context=active_code_context,
         ),
         error_prefix="复核阶段审核智能体初始化失败:",
     )
@@ -1731,6 +1902,7 @@ def run_overall_review_stage(
             },
         )
         paths = ensure_overall_review_inputs(project_dir=project_dir, requirement_name=requirement_name)
+        active_code_context = _build_overall_review_active_code_context(project_dir)
         explicit_live_developer_handoff = developer_handoff if _is_live_developer_handoff(developer_handoff) else None
         explicit_live_reviewer_handoffs = tuple(item for item in reviewer_handoff if _is_live_reviewer_handoff(item))
         discovered_developer_handoff, discovered_reviewer_handoffs = discover_live_development_handoffs(
@@ -1747,23 +1919,7 @@ def run_overall_review_stage(
             source_summary = _render_live_handoff_source_summary(live_developer_handoff, live_reviewer_handoffs)
             if source_summary:
                 message(source_summary)
-        else:
-            cleanup_paths.extend(cleanup_runtime_dirs_by_scope(
-                runtime_root=Path(project_dir).expanduser().resolve() / DEVELOPMENT_RUNTIME_ROOT_NAME,
-                project_dir=project_dir,
-                requirement_name=requirement_name,
-                workflow_action="stage.a07.start",
-            ))
-            cleanup_paths.extend(cleanup_stale_overall_review_runtime_state(project_dir, requirement_name))
         effective_reviewer_handoffs = live_reviewer_handoffs or tuple(reviewer_handoff)
-        cleanup_paths.extend(cleanup_existing_overall_review_artifacts(paths, requirement_name, audit_context))
-        _write_overall_review_state(paths["state_path"], passed=False)
-        append_stage_audit_record(
-            audit_context,
-            event_type="developer_output",
-            source_paths={"developer_output": paths["developer_output_path"]},
-            metadata={"trigger": "overall_review_initial_input"},
-        )
 
         developer_plan: DeveloperPlan | None = None
         if live_developer_handoff is not None:
@@ -1834,6 +1990,33 @@ def run_overall_review_stage(
                     stage_key="overall_review_reviewer_selection",
                 )
             )
+        review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and not str(getattr(args, "review_max_rounds", "") or "").strip(),
+        )
+        review_round_policy = ReviewRoundPolicy(
+            resolve_overall_review_max_rounds(
+                args,
+                progress=progress,
+                allow_back=review_round_allow_back,
+            )
+        )
+        if live_developer_handoff is None and not live_reviewer_handoffs:
+            cleanup_paths.extend(cleanup_runtime_dirs_by_scope(
+                runtime_root=Path(project_dir).expanduser().resolve() / DEVELOPMENT_RUNTIME_ROOT_NAME,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                workflow_action="stage.a07.start",
+            ))
+            cleanup_paths.extend(cleanup_stale_overall_review_runtime_state(project_dir, requirement_name))
+        cleanup_paths.extend(cleanup_existing_overall_review_artifacts(paths, requirement_name, audit_context))
+        _write_overall_review_state(paths["state_path"], passed=False)
+        append_stage_audit_record(
+            audit_context,
+            event_type="developer_output",
+            source_paths={"developer_output": paths["developer_output_path"]},
+            metadata={"trigger": "overall_review_initial_input"},
+        )
         reviewers = build_reviewer_workers(
             args,
             project_dir=project_dir,
@@ -1850,21 +2033,11 @@ def run_overall_review_stage(
             paths=paths,
             reviewer_specs_by_name=reviewer_specs_by_name,
             progress=progress,
+            active_code_context=active_code_context,
         )
 
         developer_initialized = False
         round_index = 1
-        review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
-            allow_previous_stage_back,
-            stdin_is_interactive() and not str(getattr(args, "review_max_rounds", "") or "").strip(),
-        )
-        review_round_policy = ReviewRoundPolicy(
-            resolve_overall_review_max_rounds(
-                args,
-                progress=progress,
-                allow_back=review_round_allow_back,
-            )
-        )
         previous_review_msg = ""
         code_change_msg = ""
         while True:
@@ -1893,7 +2066,7 @@ def run_overall_review_stage(
                             review_md=str(reviewer.review_md_path.resolve()),
                             review_json=str(reviewer.review_json_path.resolve()),
                         )
-                        + _build_overall_review_active_code_context(project_dir),
+                        + active_code_context,
                     round_index=round_index,
                     progress=progress,
                 )
@@ -1916,7 +2089,7 @@ def run_overall_review_stage(
                             review_md=str(reviewer.review_md_path.resolve()),
                             review_json=str(reviewer.review_json_path.resolve()),
                         )
-                        + _build_overall_review_active_code_context(project_dir),
+                        + active_code_context,
                     round_index=round_index,
                     progress=progress,
                 )
@@ -1984,6 +2157,7 @@ def run_overall_review_stage(
                     requirement_name=requirement_name,
                     paths=paths,
                     progress=progress,
+                    active_code_context=active_code_context,
                 )
                 developer_initialized = True
             developer, code_change_msg = refine_overall_review_code(

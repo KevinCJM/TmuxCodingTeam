@@ -837,37 +837,55 @@ def recreate_developer_runtime(
     developer: DeveloperRuntime,
     progress: ReviewStageProgress | None = None,
     launch_coordinator: LaunchCoordinator | None = None,
+    force_model_change: bool = False,
     required_reconfiguration: bool = False,
     reason_text: str = "",
+    reuse_existing_selection: bool = False,
 ) -> DeveloperRuntime | None:
     scope_requirement_name = (
         str(requirement_name).strip()
         or str(getattr(developer.worker, "_runtime_metadata", {}).get("requirement_name", "") or "").strip()
     )
-    if required_reconfiguration and not stdin_is_interactive():
-        raise RuntimeError("开发工程师需要重新配置智能体，但当前环境无法交互选择厂商/模型。")
-    if not required_reconfiguration and not stdin_is_interactive():
-        raise RuntimeError("开发工程师已死亡，需要人工选择厂商/模型/推理/代理后才能重建。")
     developer_name = str(developer.worker.session_name or "开发工程师").strip() or "开发工程师"
-    selection = (
-        prompt_required_replacement_review_agent_selection(
-            reason_text=reason_text or f"检测到{developer_name}不可继续使用，需要更换模型后继续当前阶段。",
-            previous_selection=developer.selection,
-            force_model_change=True,
-            role_label=developer_name,
-            progress=progress,
+    if force_model_change:
+        if required_reconfiguration and not stdin_is_interactive():
+            raise RuntimeError("开发工程师需要重新配置智能体，但当前环境无法交互选择厂商/模型。")
+        if not required_reconfiguration and not stdin_is_interactive():
+            return None
+        selection = (
+            prompt_required_replacement_review_agent_selection(
+                reason_text=reason_text or f"检测到{developer_name}不可继续使用，需要更换模型后继续当前阶段。",
+                previous_selection=developer.selection,
+                force_model_change=True,
+                role_label=developer_name,
+                progress=progress,
+            )
+            if required_reconfiguration
+            else prompt_replacement_review_agent_selection(
+                reason_text=reason_text or f"检测到{developer_name}不可继续使用，需要更换模型后继续当前阶段。",
+                previous_selection=developer.selection,
+                force_model_change=True,
+                role_label=developer_name,
+                progress=progress,
+            )
         )
-        if required_reconfiguration
-        else prompt_replacement_review_agent_selection(
-            reason_text=f"检测到{developer_name}已死亡，需要重建开发工程师后继续当前阶段。",
-            previous_selection=developer.selection,
-            force_model_change=True,
-            role_label=developer_name,
-            progress=progress,
-        )
-    )
-    if selection is None:
-        return None
+        if selection is None:
+            return None
+    else:
+        if reuse_existing_selection:
+            selection = developer.selection
+        else:
+            if not stdin_is_interactive():
+                return None
+            selection = prompt_replacement_review_agent_selection(
+                reason_text=reason_text or f"检测到{developer_name}已死亡，需要由人类决定是否重建开发工程师。",
+                previous_selection=developer.selection,
+                force_model_change=False,
+                role_label=developer_name,
+                progress=progress,
+            )
+            if selection is None:
+                return None
     return create_developer_runtime(
         project_dir=project_dir,
         requirement_name=scope_requirement_name,
@@ -1262,6 +1280,72 @@ def _run_developer_result_turn(
     replace_dead_developer=None,
     progress: ReviewStageProgress | None = None,
 ) -> tuple[DeveloperRuntime, dict[str, object]]:
+    def _developer_output_fallback_payload() -> dict[str, object] | None:
+        if paths is None:
+            return None
+        if result_contract.mode not in {"a07_developer_task_complete", "a07_developer_refine"}:
+            return None
+        code_change = get_markdown_content(paths["developer_output_path"]).strip()
+        if not code_change:
+            return None
+        reminder_prompt = check_develop_job(
+            paths["developer_output_path"],
+            task_name,
+            task_split_md=str(paths["task_md_path"].resolve()),
+            what_just_dev=str(paths["developer_output_path"].resolve()),
+        )
+        if reminder_prompt:
+            return None
+        return {
+            "status": "completed",
+            "summary": "developer_output materialized without stable task result contract",
+        }
+
+    def _mark_developer_fallback_completed() -> None:
+        worker = current_developer.worker
+        state: dict[str, object] = {}
+        read_state = getattr(worker, "read_state", None)
+        if callable(read_state):
+            with suppress(Exception):
+                raw_state = read_state()
+                if isinstance(raw_state, dict):
+                    state = raw_state
+        task_status_path_text = str(
+            getattr(worker, "current_task_status_path", "") or state.get("current_task_status_path", "") or ""
+        ).strip()
+        if task_status_path_text:
+            with suppress(Exception):
+                write_task_status(Path(task_status_path_text), status=TASK_STATUS_DONE)
+        result_path_text = str(
+            getattr(worker, "current_task_result_path", "") or state.get("current_task_result_path", "") or ""
+        ).strip()
+        with suppress(Exception):
+            worker.current_task_runtime_status = TASK_STATUS_DONE
+        with suppress(Exception):
+            worker.agent_ready = True
+        with suppress(Exception):
+            worker.agent_started = True
+        with suppress(Exception):
+            worker.agent_state = AgentRuntimeState.READY
+        write_state = getattr(worker, "_write_state", None)
+        if callable(write_state):
+            extra: dict[str, object] = {
+                "label": label,
+                "result_status": "succeeded",
+                "current_task_runtime_status": TASK_STATUS_DONE,
+                "dispatch_state": "",
+                "dispatch_reason": "",
+                "agent_ready": True,
+                "agent_started": True,
+                "agent_state": AgentRuntimeState.READY.value,
+            }
+            if task_status_path_text:
+                extra["current_task_status_path"] = task_status_path_text
+            if result_path_text:
+                extra["current_task_result_path"] = result_path_text
+            with suppress(Exception):
+                write_state(WorkerStatus.SUCCEEDED, note=f"done:{label}", extra=extra)
+
     current_developer = developer
     while True:
         try:
@@ -1288,6 +1372,8 @@ def _run_developer_result_turn(
                 turn_policy.record_turn()
             return current_developer, payload
         except Exception as error:  # noqa: BLE001
+            if not _worker_has_stale_busy_without_contract(current_developer.worker) and try_resume_worker(current_developer.worker, timeout_sec=60.0):
+                continue
             if is_agent_ready_timeout_error(error):
                 if replace_dead_developer is not None:
                     current_developer = replace_dead_developer(current_developer, error)
@@ -1311,10 +1397,20 @@ def _run_developer_result_turn(
             if is_recoverable_startup_failure(error, current_developer.worker) and replace_dead_developer is not None:
                 current_developer = replace_dead_developer(current_developer, error)
                 continue
+            fallback_payload = _developer_output_fallback_payload()
+            error_text = str(error or "")
+            developer_completion_delayed = (
+                is_task_result_contract_error(error)
+                or isinstance(error, TimeoutError)
+                or "等待任务结果超时" in error_text
+                or "waiting for task result" in error_text.lower()
+            )
+            if developer_completion_delayed:
+                if fallback_payload is not None and _worker_appears_live_for_reviewer_recovery(current_developer.worker):
+                    _mark_developer_fallback_completed()
+                    return current_developer, fallback_payload
             if is_task_result_contract_error(error):
                 raise
-            if try_resume_worker(current_developer.worker, timeout_sec=60.0):
-                continue
             raise RuntimeError(f"{current_developer.worker.session_name or '开发工程师'} 执行失败") from error
 
 
@@ -1851,6 +1947,10 @@ def _development_reviewer_target_paths(
     return tuple(targets)
 
 
+def _development_developer_display_name(developer: DeveloperRuntime) -> str:
+    return str(developer.worker.session_name or "开发工程师").strip() or "开发工程师"
+
+
 def _kill_development_reviewer_best_effort(reviewer: ReviewerRuntime) -> None:
     with suppress(Exception):
         reviewer.worker.request_kill()
@@ -1940,6 +2040,8 @@ def _run_single_reviewer_initialization(
             return current_reviewer
         except Exception as error:  # noqa: BLE001
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
+            if not _worker_has_stale_busy_without_contract(current_reviewer.worker) and try_resume_worker(current_reviewer.worker, timeout_sec=60.0):
+                continue
             if is_worker_death_error(error):
                 failure_reason = describe_reviewer_failure_reason(error, current_reviewer.worker)
                 failed_reviewer = note_reviewer_failure(current_reviewer, reason_text=failure_reason)
@@ -2460,6 +2562,60 @@ def recreate_development_reviewer_runtime(
     return replacement
 
 
+def _clear_developer_manual_recheck_state(developer: DeveloperRuntime) -> DeveloperRuntime:
+    worker = developer.worker
+    state: dict[str, object] = {}
+    read_state = getattr(worker, "read_state", None)
+    if callable(read_state):
+        with suppress(Exception):
+            raw_state = read_state()
+            if isinstance(raw_state, dict):
+                state = raw_state
+    live_worker = _worker_appears_live_for_reviewer_recovery(worker)
+    agent_state_text = str(state.get("agent_state", "") or "").strip().upper()
+    ready_like = live_worker and agent_state_text in {"", "READY", "STARTING"}
+    busy_like = live_worker and agent_state_text == "BUSY"
+    if ready_like:
+        with suppress(Exception):
+            worker.agent_ready = True
+        with suppress(Exception):
+            worker.agent_state = AgentRuntimeState.READY
+    write_state = getattr(worker, "_write_state", None)
+    if callable(write_state):
+        extra = {
+            "result_status": WorkerStatus.READY.value if ready_like else "running",
+            "current_task_runtime_status": "",
+            "dispatch_state": "",
+            "dispatch_reason": "",
+            "health_status": "alive" if live_worker else str(state.get("health_status", "") or "unknown"),
+            "health_note": "manual_recheck",
+            "last_provider_error": "",
+        }
+        if ready_like:
+            extra.update(
+                {
+                    "agent_ready": True,
+                    "agent_alive": True,
+                    "agent_state": AgentRuntimeState.READY.value,
+                }
+            )
+        elif busy_like:
+            extra.update(
+                {
+                    "agent_ready": False,
+                    "agent_alive": True,
+                    "agent_state": AgentRuntimeState.BUSY.value,
+                }
+            )
+        with suppress(Exception):
+            write_state(WorkerStatus.READY if ready_like else WorkerStatus.RUNNING, note="manual_recheck", extra=extra)
+    log_event = getattr(worker, "_log_event", None)
+    if callable(log_event):
+        with suppress(Exception):
+            log_event("manual_recheck_state_cleared", role_name="developer")
+    return developer
+
+
 def _worker_appears_live_for_reviewer_recovery(worker: object | None) -> bool:
     if worker is None:
         return False
@@ -2522,6 +2678,7 @@ def _clear_reviewer_manual_recheck_state(reviewer: ReviewerRuntime) -> ReviewerR
             "dispatch_reason": "",
             "health_status": "alive" if live_worker else str(state.get("health_status", "") or "unknown"),
             "health_note": "manual_recheck",
+            "last_provider_error": "",
         }
         if ready_like:
             extra.update(
@@ -2550,7 +2707,7 @@ def _clear_reviewer_manual_recheck_state(reviewer: ReviewerRuntime) -> ReviewerR
     return reviewer
 
 
-def _describe_reviewer_dispatch_blocker(worker: object | None) -> str:
+def _describe_worker_dispatch_blocker(worker: object | None) -> str:
     if worker is None:
         return ""
     read_state = getattr(worker, "read_state", None)
@@ -2563,13 +2720,35 @@ def _describe_reviewer_dispatch_blocker(worker: object | None) -> str:
     if not isinstance(state, dict):
         return ""
     dispatch_reason = str(state.get("dispatch_reason", "") or "").strip()
+    if dispatch_reason.startswith("prompt_dispatch_timeout:"):
+        detail = dispatch_reason.split(":", 1)[1].strip()
+        return f"prompt 投递超时：tmux 在装载或粘贴 prompt 时阻塞。{detail}".strip()
     if dispatch_reason.startswith("prompt_confirm_timeout:"):
         detail = dispatch_reason.split(":", 1)[1].strip()
-        return f"prompt 确认超时：已投递 prompt，但未观测到智能体确认。{detail}".strip()
+        return f"prompt 确认超时：已投递 prompt，但未观测到确认回显。worker 仍可能正常运行；系统自动重检失败后才进入人工介入。{detail}".strip()
     if dispatch_reason.startswith("ready_wait_timeout:"):
         detail = dispatch_reason.split(":", 1)[1].strip()
         return f"等待智能体 READY 超时：{detail}".strip()
+    if dispatch_reason.startswith("stale_busy_without_contract:"):
+        detail = dispatch_reason.split(":", 1)[1].strip()
+        return f"tmux 已进入空闲/可输入状态，但合同文件一直没有产出，当前 turn 被判定为假 BUSY 卡住。{detail}".strip()
     return dispatch_reason
+
+
+def _worker_has_stale_busy_without_contract(worker: object | None) -> bool:
+    if worker is None:
+        return False
+    read_state = getattr(worker, "read_state", None)
+    if not callable(read_state):
+        return False
+    try:
+        state = read_state()
+    except Exception:
+        return False
+    if not isinstance(state, dict):
+        return False
+    dispatch_reason = str(state.get("dispatch_reason", "") or "").strip()
+    return dispatch_reason.startswith("stale_busy_without_contract:")
 
 
 def _build_reviewer_recovery_reason(
@@ -2579,7 +2758,7 @@ def _build_reviewer_recovery_reason(
     fallback_reason: str,
 ) -> str:
     details = []
-    dispatch_blocker = _describe_reviewer_dispatch_blocker(reviewer.worker)
+    dispatch_blocker = _describe_worker_dispatch_blocker(reviewer.worker)
     output_issue = _describe_reviewer_output_contract_issue(reviewer, task_name)
     if dispatch_blocker:
         details.append(dispatch_blocker)
@@ -2900,7 +3079,7 @@ def run_reviewer_turn_with_recreation(
                     return None
                 current_reviewer = initialized
                 continue
-            if try_resume_worker(current_reviewer.worker, timeout_sec=60.0):
+            if not _worker_has_stale_busy_without_contract(current_reviewer.worker) and try_resume_worker(current_reviewer.worker, timeout_sec=60.0):
                 continue
             reason_text = (
                 f"{reviewer_display_name} 当前仍存活但上一轮执行异常。"
@@ -3220,7 +3399,8 @@ def _replace_dead_developer(
     launch_coordinator: LaunchCoordinator | None = None,
     error: Exception | None = None,
 ) -> DeveloperRuntime:
-    developer_name = str(developer.worker.session_name or "开发工程师").strip() or "开发工程师"
+    developer_name = _development_developer_display_name(developer)
+    ready_timeout_recreate_requested = False
     if error is not None and is_agent_ready_timeout_error(error):
         reason_text = (
             f"{developer_name}启动超时，未能进入可输入状态。\n"
@@ -3234,8 +3414,11 @@ def _replace_dead_developer(
             reason_text=reason_text,
             allow_recreate=True,
         )
+        if decision == AGENT_INTERVENTION_RECHECK:
+            return _clear_developer_manual_recheck_state(developer)
         if decision != AGENT_INTERVENTION_RECREATE:
             return developer
+        ready_timeout_recreate_requested = True
     startup_reconfigure = bool(error is not None and is_recoverable_startup_failure(error, developer.worker))
     if startup_reconfigure:
         reason_text = (
@@ -3245,6 +3428,41 @@ def _replace_dead_developer(
             if worker_has_provider_runtime_error(developer.worker)
             else f"{developer_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
         )
+        if not ready_timeout_recreate_requested:
+            decision = request_worker_manual_intervention(
+                stage_label="任务开发",
+                role_label=developer_name,
+                worker=developer.worker,
+                reason_text=reason_text,
+                progress=progress,
+                allow_recreate=True,
+                allow_worker_dead=False,
+            )
+            if decision == AGENT_INTERVENTION_RECHECK:
+                return _clear_developer_manual_recheck_state(developer)
+            if decision != AGENT_INTERVENTION_RECREATE:
+                return developer
+    elif not ready_timeout_recreate_requested:
+        failure_reason = describe_reviewer_failure_reason(error or "", developer.worker)
+        live_hint = "当前仍存活但本轮执行异常" if _worker_appears_live_for_reviewer_recovery(developer.worker) else "本轮执行失败或已死亡"
+        reason_text = f"{developer_name}{live_hint}。\n{failure_reason or str(error or '')}".strip()
+        dispatch_blocker = _describe_worker_dispatch_blocker(developer.worker)
+        if dispatch_blocker:
+            reason_text = f"{reason_text}\n{dispatch_blocker}".strip()
+        decision = request_worker_manual_intervention(
+            stage_label="任务开发",
+            role_label=developer_name,
+            worker=developer.worker,
+            reason_text=reason_text,
+            progress=progress,
+            allow_recreate=True,
+            allow_worker_dead=False,
+        )
+        if decision == AGENT_INTERVENTION_RECHECK:
+            return _clear_developer_manual_recheck_state(developer)
+        if decision != AGENT_INTERVENTION_RECREATE:
+            return developer
+    if startup_reconfigure:
         mark_worker_awaiting_reconfiguration(developer.worker, reason_text=reason_text)
     replacement = recreate_developer_runtime(
         project_dir=project_dir,
@@ -3252,12 +3470,14 @@ def _replace_dead_developer(
         developer=developer,
         progress=progress,
         launch_coordinator=launch_coordinator,
-        required_reconfiguration=True,
+        force_model_change=startup_reconfigure,
+        required_reconfiguration=startup_reconfigure,
         reason_text=(
             reason_text
             if startup_reconfigure
-            else f"{developer_name}已死亡，必须重新选择厂商/模型/推理/代理后从当前阶段继续。"
+            else f"{developer_name}已死亡，将尝试按原配置重建后继续当前阶段。"
         ),
+        reuse_existing_selection=not startup_reconfigure,
     )
     if replacement is None:
         raise RuntimeError(f"{developer_name} 已死亡，且未能重建开发工程师")

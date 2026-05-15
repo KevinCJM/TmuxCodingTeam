@@ -1,6 +1,6 @@
 import { createCliRenderer } from '@opentui/core'
 import { render } from '@opentui/solid'
-import { App, stopBackendClient } from './app'
+import { App, getLatestBackendCleanupContext, runBackendCleanupFallback, stopBackendClient } from './app'
 import { copyToClipboard } from './clipboard'
 
 type StartupRoute = 'home' | 'routing' | 'requirements' | 'review' | 'design' | 'task-split' | 'development' | 'overall-review' | 'control'
@@ -91,7 +91,10 @@ async function shutdownFromSignal(signal: ShutdownSignal) {
   } catch {
     // Renderer may already be shutting down.
   }
-  await stopBackendClient()
+  const stopResult = await stopBackendClient({ reason: 'signal', forceKillAfterMs: 30000 })
+  if (!stopResult.graceful || stopResult.signalEscalatedToSigkill) {
+    await runBackendCleanupFallback(getLatestBackendCleanupContext())
+  }
   process.exit(exitCodeForSignal(signal))
 }
 

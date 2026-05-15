@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -32,6 +33,10 @@ _PROMPT_METADATA: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVa
 
 class PromptBackRequested(Exception):
     """Raised when a bridge client requests returning to the previous setup prompt."""
+
+
+_EXTERNAL_PROCESS_SIGINT_WAIT_SEC = 30.0
+_EXTERNAL_PROCESS_SIGTERM_WAIT_SEC = 10.0
 
 
 def _current_prompt_metadata() -> dict[str, Any]:
@@ -239,11 +244,30 @@ class StdioTerminalUI:
     ) -> int:
         merged_env = dict(os.environ)
         merged_env.update(dict(env or {}))
+        child = subprocess.Popen(list(command), cwd=cwd, env=merged_env)
         try:
-            completed = subprocess.run(list(command), cwd=cwd, env=merged_env, check=False)
+            return int(child.wait())
         except KeyboardInterrupt:
+            try:
+                child.send_signal(signal.SIGINT)
+            except Exception:
+                return 130
+            try:
+                child.wait(timeout=_EXTERNAL_PROCESS_SIGINT_WAIT_SEC)
+                return 130
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                child.terminate()
+                child.wait(timeout=_EXTERNAL_PROCESS_SIGTERM_WAIT_SEC)
+                return 130
+            except Exception:
+                pass
+            with contextlib.suppress(Exception):
+                child.kill()
+            with contextlib.suppress(Exception):
+                child.wait()
             return 130
-        return int(completed.returncode)
 
 
 @dataclass

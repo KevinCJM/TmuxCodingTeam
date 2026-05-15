@@ -2,6 +2,17 @@ import { stageRouteForAction } from './stageRegistry'
 import type { HomeAgentItem, WorkerSnapshot } from './types'
 
 const LIVE_WORKER_HEALTH_STATUSES = new Set(['alive', 'observe_error', 'provider_auth_error'])
+const RUNNING_WORKER_STATUSES = new Set(['running', 'busy', 'submitted', 'submitting'])
+const READY_WORKER_STATUSES = new Set(['done', 'succeeded', 'completed', 'ready', 'idle'])
+const FAILED_WORKER_STATUSES = new Set(['failed', 'stale_failed', 'error'])
+const STALE_MISSING_SESSION_LIVE_EVIDENCE_MS = 300_000
+const HOME_AGENT_STATE_RANK: Record<string, number> = {
+  UNKNOWN: 0,
+  DEAD: 1,
+  READY: 2,
+  STARTING: 3,
+  BUSY: 4,
+}
 const SOURCE_RANK: Record<HomeAgentItem['source'], number> = {
   control: 7,
   routing: 6,
@@ -45,19 +56,41 @@ type HomeAgentSortEntry = {
 
 export function isRunningWorker(worker: WorkerSnapshot): boolean {
   if (!worker.sessionName.trim()) return false
-  const agentState = String(worker.agentState || '').trim().toUpperCase()
-  if (agentState === 'DEAD' || agentState === 'STARTING') return true
-  if (worker.sessionExists !== undefined) return worker.sessionExists
-  return LIVE_WORKER_HEALTH_STATUSES.has(worker.healthStatus)
+  if (isStaleMissingSessionLiveWorker(worker)) return false
+  const healthStatus = String(worker.healthStatus || '').trim().toLowerCase()
+  const agentState = resolveHomeAgentState(worker)
+  if (worker.sessionExists === true) return true
+  if (agentState === 'BUSY' || agentState === 'DEAD' || agentState === 'STARTING') return true
+  if (worker.sessionExists === false) return LIVE_WORKER_HEALTH_STATUSES.has(healthStatus)
+  return LIVE_WORKER_HEALTH_STATUSES.has(healthStatus)
 }
 
 export function resolveHomeAgentState(worker: WorkerSnapshot): string {
   const agentState = String(worker.agentState || '').trim().toUpperCase()
+  const healthStatus = String(worker.healthStatus || '').trim().toLowerCase()
+  const status = String(worker.status || '').trim().toLowerCase()
+  const resultStatus = String(worker.resultStatus || '').trim().toLowerCase()
+  const runtimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
   if (agentState === 'DEAD') return 'DEAD'
+  if (
+    READY_WORKER_STATUSES.has(runtimeStatus) ||
+    READY_WORKER_STATUSES.has(resultStatus) ||
+    READY_WORKER_STATUSES.has(status)
+  ) return 'READY'
+  if (RUNNING_WORKER_STATUSES.has(runtimeStatus) && agentState !== 'READY') return 'BUSY'
+  if (FAILED_WORKER_STATUSES.has(resultStatus) || FAILED_WORKER_STATUSES.has(status)) return 'READY'
   if (agentState === 'STARTING') return 'STARTING'
   if (agentState === 'BUSY') return 'BUSY'
   if (agentState === 'READY') return 'READY'
+  if (healthStatus === 'dead') return 'DEAD'
+  if (RUNNING_WORKER_STATUSES.has(resultStatus)) return 'BUSY'
+  if (RUNNING_WORKER_STATUSES.has(status)) return 'BUSY'
   return 'UNKNOWN'
+}
+
+export function isBusyWorker(worker: WorkerSnapshot): boolean {
+  if (isStaleMissingSessionLiveWorker(worker)) return false
+  return resolveHomeAgentState(worker) === 'BUSY'
 }
 
 function workerFreshnessTs(worker: WorkerSnapshot): number {
@@ -66,6 +99,33 @@ function workerFreshnessTs(worker: WorkerSnapshot): number {
   const updatedAt = Number.isFinite(updatedAtTs) ? updatedAtTs : 0
   const heartbeat = Number.isFinite(heartbeatTs) ? heartbeatTs : 0
   return Math.max(updatedAt, heartbeat)
+}
+
+function workerHasActiveTurnEvidence(worker: WorkerSnapshot): boolean {
+  const status = String(worker.status || '').trim().toLowerCase()
+  const resultStatus = String(worker.resultStatus || '').trim().toLowerCase()
+  const runtimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
+  const dispatchState = String(worker.dispatchState || '').trim().toLowerCase()
+  if (RUNNING_WORKER_STATUSES.has(runtimeStatus)) return true
+  if (RUNNING_WORKER_STATUSES.has(resultStatus) || RUNNING_WORKER_STATUSES.has(status)) return true
+  if (dispatchState === 'submitting' || dispatchState === 'submitted') return true
+  return Boolean(String(worker.turnStatusPath || '').trim())
+}
+
+function isStaleMissingSessionLiveWorker(worker: WorkerSnapshot): boolean {
+  if (worker.sessionExists !== false) return false
+  const healthStatus = String(worker.healthStatus || '').trim().toLowerCase()
+  if (!LIVE_WORKER_HEALTH_STATUSES.has(healthStatus)) return false
+  const status = String(worker.status || '').trim().toLowerCase()
+  const resultStatus = String(worker.resultStatus || '').trim().toLowerCase()
+  if (FAILED_WORKER_STATUSES.has(status) || FAILED_WORKER_STATUSES.has(resultStatus)) return false
+  const agentState = String(worker.agentState || '').trim().toUpperCase()
+  if (agentState === 'DEAD' || agentState === 'STARTING') return false
+  if (workerHasActiveTurnEvidence(worker)) return false
+  const freshness = workerFreshnessTs(worker)
+  if (freshness <= 0) return false
+  const now = Date.now()
+  return freshness <= now && now - freshness > STALE_MISSING_SESSION_LIVE_EVIDENCE_MS
 }
 
 function allowedHomeSources(activeStage: string): ReadonlySet<HomeAgentItem['source']> | null {
@@ -207,14 +267,15 @@ export function buildHomeAgents(
       const sourceRank = SOURCE_RANK[source.source] || 0
       const previousSourceRank = sourceRankBySession.get(sessionName) || 0
       const previousAgentState = String(deduped.get(sessionName)?.item.agentState || '').trim().toUpperCase()
+      const previousAgentRank = HOME_AGENT_STATE_RANK[previousAgentState] || 0
+      const nextAgentRank = HOME_AGENT_STATE_RANK[nextAgentState] || 0
       if (deduped.has(sessionName)) {
         if (previousFreshness > freshness) continue
         if (previousFreshness === freshness) {
-          if (previousAgentState === 'DEAD' && nextAgentState !== 'DEAD') {
-            // Prefer a live backend state over a same-timestamp stale DEAD projection.
-          } else if (previousAgentState !== 'DEAD' && nextAgentState === 'DEAD') {
+          if (previousAgentRank > nextAgentRank) {
             continue
-          } else if (previousSourceRank >= sourceRank) {
+          }
+          if (previousAgentRank === nextAgentRank && previousSourceRank >= sourceRank) {
             continue
           }
         }

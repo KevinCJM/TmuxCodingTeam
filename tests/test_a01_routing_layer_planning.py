@@ -443,6 +443,56 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertIn("project:create_running/BUSY", text)
         self.assertIn("create_routing_layer", text)
 
+    def test_render_live_progress_line_does_not_write_manifest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            state_path = Path(tmpdir) / "worker.state.json"
+            state_path.write_text(json.dumps({"agent_state": "READY"}, ensure_ascii=False), encoding="utf-8")
+            selection = TargetSelection(
+                project_dir=str(project_dir),
+                selected_dirs=(str(project_dir),),
+                skipped_dirs=(),
+                forced_dirs=(),
+                project_missing_files=(),
+            )
+            run_store = RunStore(
+                run_root=Path(tmpdir) / "runtime" / "run_demo",
+                manifest=RunManifest(
+                    manifest_version=1,
+                    run_id="run_demo",
+                    runtime_dir=str(Path(tmpdir) / "runtime" / "run_demo"),
+                    project_dir=str(project_dir),
+                    selection={},
+                    config={},
+                    status="running",
+                    created_at="2026-05-12T12:00:00",
+                    updated_at="2026-05-12T12:00:00",
+                    workers=[
+                        WorkerManifestEntry(
+                            work_dir=str(project_dir),
+                            session_name="aginit-demo-1",
+                            workflow_stage="create_running",
+                            result_status="running",
+                            agent_state="BUSY",
+                            health_status="alive",
+                            note="create_routing_layer",
+                            state_path=str(state_path),
+                        )
+                    ],
+                ),
+            )
+
+            with patch.object(RunStore, "write_manifest", side_effect=AssertionError("manifest write")), patch.object(
+                RunStore,
+                "update_worker_state_from_file",
+                side_effect=AssertionError("progress render must be read-only"),
+            ) as update_state:
+                text = render_live_progress_line(run_store=run_store, selection=selection, tick=1)
+
+        self.assertIn("project:create_running/BUSY", text)
+        update_state.assert_not_called()
+
     def test_render_live_progress_displays_prelaunch_dead_state_as_starting(self):
         run_store = type(
             "RunStoreStub",
@@ -488,7 +538,7 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertIn("state=STARTING", frame)
         self.assertIn("project:create_running/STARTING", line)
 
-    def test_render_live_progress_line_refreshes_worker_state_file(self):
+    def test_render_live_progress_line_uses_manifest_without_refreshing_worker_state_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "worker.state.json"
             state_path.write_text(
@@ -516,6 +566,7 @@ class RoutingLayerCliTests(unittest.TestCase):
 
             class _RunStoreStub:
                 def __init__(self) -> None:
+                    self.update_called = False
                     self.manifest = RunManifest(
                         manifest_version=1,
                         run_id="run_demo",
@@ -530,6 +581,7 @@ class RoutingLayerCliTests(unittest.TestCase):
                     )
 
                 def update_worker_state_from_file(self, work_dir, state_path, *, preserve_workflow_fields=False):  # noqa: ANN001
+                    self.update_called = True
                     payload = json.loads(Path(state_path).read_text(encoding="utf-8"))
                     self.manifest.workers[0].agent_state = str(payload["agent_state"])
                     self.manifest.workers[0].health_status = str(payload["health_status"])
@@ -543,10 +595,12 @@ class RoutingLayerCliTests(unittest.TestCase):
                 forced_dirs=(),
                 project_missing_files=(),
             )
-            text = render_live_progress_line(run_store=_RunStoreStub(), selection=selection, tick=0)
+            run_store = _RunStoreStub()
+            text = render_live_progress_line(run_store=run_store, selection=selection, tick=0)
 
-        self.assertIn("project:create_running/BUSY", text)
-        self.assertIn("turn:create_routing_layer", text)
+        self.assertIn("project:create_running/STARTING", text)
+        self.assertIn("create_routing_layer", text)
+        self.assertFalse(run_store.update_called)
 
     def test_collect_cli_request_uses_project_arg_without_prompting_for_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:

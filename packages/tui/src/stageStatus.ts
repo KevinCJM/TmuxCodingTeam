@@ -31,6 +31,14 @@ type StageChangedPayload = {
   stageSeq?: unknown
 }
 
+const ACTIVE_RUNTIME_STATUSES = new Set(['running', 'pending'])
+const ACTIVE_WORKER_STATUSES = new Set(['running', 'pending', 'submitted', 'submitting'])
+const TERMINAL_RUNTIME_STATUSES = new Set(['done', 'succeeded', 'completed'])
+const COMPLETED_WORKER_STATUSES = new Set(['done', 'succeeded', 'completed', 'ready', 'idle'])
+const FAILED_WORKER_STATUSES = new Set(['failed', 'stale_failed', 'error'])
+const LIVE_WORKER_HEALTH_STATUSES = new Set(['alive', 'observe_error', 'provider_auth_error'])
+const STALE_MISSING_SESSION_LIVE_EVIDENCE_MS = 300_000
+
 export function applyStageChanged(cursor: StageCursor, payload: StageChangedPayload): {
   cursor: StageCursor
   accepted: boolean
@@ -93,17 +101,61 @@ function getWorkers(value: unknown): Array<Record<string, unknown>> {
 function workerHasLiveWork(worker: Record<string, unknown>): boolean {
   const sessionName = String(worker.session_name ?? worker.sessionName ?? '').trim()
   if (!sessionName) return false
+  if (workerIsStaleMissingSessionLiveNoise(worker)) return false
   const agentState = String(worker.agent_state ?? worker.agentState ?? '').trim().toUpperCase()
   const status = String(worker.status ?? '').trim().toLowerCase()
+  const resultStatus = String(worker.result_status ?? worker.resultStatus ?? '').trim().toLowerCase()
   const runtimeStatus = String(worker.current_task_runtime_status ?? worker.currentTaskRuntimeStatus ?? '').trim().toLowerCase()
   const healthStatus = String(worker.health_status ?? worker.healthStatus ?? '').trim().toLowerCase()
   if (agentState === 'DEAD' || healthStatus === 'dead') return false
-  if (agentState === 'READY') return false
-  if (['done', 'succeeded', 'completed'].includes(runtimeStatus)) return false
-  if (['done', 'succeeded', 'completed', 'ready', 'idle', 'failed', 'stale_failed', 'error'].includes(status)) return false
+  if (
+    TERMINAL_RUNTIME_STATUSES.has(runtimeStatus) ||
+    COMPLETED_WORKER_STATUSES.has(resultStatus) ||
+    COMPLETED_WORKER_STATUSES.has(status)
+  ) return false
+  if (ACTIVE_RUNTIME_STATUSES.has(runtimeStatus) && agentState !== 'READY') return true
+  if (FAILED_WORKER_STATUSES.has(resultStatus) || FAILED_WORKER_STATUSES.has(status)) return false
   if (agentState === 'BUSY' || agentState === 'STARTING') return true
-  if (status === 'running' || status === 'pending' || runtimeStatus === 'running') return true
+  if (agentState === 'READY') return false
+  if (ACTIVE_WORKER_STATUSES.has(resultStatus) || ACTIVE_WORKER_STATUSES.has(status)) return true
   return false
+}
+
+function workerFreshnessTs(worker: Record<string, unknown>): number {
+  const updatedAtTs = Date.parse(String(worker.updated_at ?? worker.updatedAt ?? '').trim())
+  const heartbeatTs = Date.parse(String(worker.last_heartbeat_at ?? worker.lastHeartbeatAt ?? '').trim())
+  const updatedAt = Number.isFinite(updatedAtTs) ? updatedAtTs : 0
+  const heartbeat = Number.isFinite(heartbeatTs) ? heartbeatTs : 0
+  return Math.max(updatedAt, heartbeat)
+}
+
+function workerHasActiveTurnEvidence(worker: Record<string, unknown>): boolean {
+  const status = String(worker.status ?? '').trim().toLowerCase()
+  const resultStatus = String(worker.result_status ?? worker.resultStatus ?? '').trim().toLowerCase()
+  const runtimeStatus = String(worker.current_task_runtime_status ?? worker.currentTaskRuntimeStatus ?? '').trim().toLowerCase()
+  const dispatchState = String(worker.dispatch_state ?? worker.dispatchState ?? '').trim().toLowerCase()
+  if (ACTIVE_RUNTIME_STATUSES.has(runtimeStatus)) return true
+  if (ACTIVE_WORKER_STATUSES.has(resultStatus) || ACTIVE_WORKER_STATUSES.has(status)) return true
+  if (dispatchState === 'submitting' || dispatchState === 'submitted') return true
+  return Boolean(String(worker.turn_status_path ?? worker.turnStatusPath ?? '').trim())
+}
+
+function workerIsStaleMissingSessionLiveNoise(worker: Record<string, unknown>): boolean {
+  if (Boolean(worker.session_exists ?? worker.sessionExists)) return false
+  const hasExplicitSessionExists = 'session_exists' in worker || 'sessionExists' in worker
+  if (!hasExplicitSessionExists) return false
+  const healthStatus = String(worker.health_status ?? worker.healthStatus ?? '').trim().toLowerCase()
+  if (!LIVE_WORKER_HEALTH_STATUSES.has(healthStatus)) return false
+  const status = String(worker.status ?? '').trim().toLowerCase()
+  const resultStatus = String(worker.result_status ?? worker.resultStatus ?? '').trim().toLowerCase()
+  if (FAILED_WORKER_STATUSES.has(status) || FAILED_WORKER_STATUSES.has(resultStatus)) return false
+  const agentState = String(worker.agent_state ?? worker.agentState ?? '').trim().toUpperCase()
+  if (agentState === 'DEAD' || agentState === 'STARTING') return false
+  if (workerHasActiveTurnEvidence(worker)) return false
+  const freshness = workerFreshnessTs(worker)
+  if (freshness <= 0) return false
+  const now = Date.now()
+  return freshness <= now && now - freshness > STALE_MISSING_SESSION_LIVE_EVIDENCE_MS
 }
 
 function stageSnapshotForAction(snapshots: Record<string, unknown>, activeStage: string): unknown {
@@ -119,7 +171,12 @@ export function stageSnapshotHasLiveWork(snapshot: unknown): boolean {
 export function inferBootstrapStatus(payload: Record<string, unknown>): string {
   const snapshots = getObject(payload.snapshots)
   const app = getObject(snapshots.app)
+  const activeStageStatus = String(app.active_stage_status ?? app.activeStageStatus ?? '').trim().toLowerCase()
+  if (activeStageStatus === 'failed' || activeStageStatus === 'error') return activeStageStatus
   if (Boolean(app.pending_hitl ?? app.pendingHitl)) return 'awaiting-input'
+  if (Boolean(app.pending_attention ?? app.pendingAttention)) return 'awaiting-input'
+  if (activeStageStatus === 'awaiting-input') return 'awaiting-input'
+  if (activeStageStatus === 'running') return 'running'
   const activeStage = String(app.active_stage ?? app.activeStage ?? '').trim()
   const stageSnapshot = stageSnapshotForAction(snapshots, activeStage)
   if (getWorkers(stageSnapshot).some(workerHasLiveWork)) return 'running'

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,16 +32,21 @@ from tmux_core.prompt_contracts.requirements_review import (
     review_feedback,
 )
 from tmux_core.runtime.contracts import (
+    TASK_STATUS_DONE,
     TaskResultContract,
     TurnFileContract,
     TurnFileResult,
     normalize_review_status_payload,
+    validate_turn_file_artifact_rules,
+    write_task_status,
 )
 from tmux_core.runtime.hitl import HitlPromptContext, build_prefixed_sha256, run_hitl_agent_loop
 from tmux_core.runtime.tmux_runtime import (
+    CommandResult,
     DEFAULT_COMMAND_TIMEOUT_SEC,
     TmuxBatchWorker,
     Vendor,
+    WorkerStatus,
     build_session_name,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
@@ -707,6 +713,104 @@ def build_reviewer_completion_contract(
     )
 
 
+def _reviewer_outputs_satisfy_contract(reviewer: ReviewerRuntime) -> bool:
+    try:
+        result = reviewer.contract.validator(reviewer.contract.status_path)
+        validate_turn_file_artifact_rules(reviewer.contract, result)
+        return True
+    except Exception:
+        return False
+
+
+def _reviewer_artifact_signature(reviewer: ReviewerRuntime) -> tuple[object, ...]:
+    signatures: list[object] = []
+    for path in (reviewer.review_md_path, reviewer.review_json_path):
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.exists():
+            signatures.append(("missing", str(resolved)))
+            continue
+        stat = resolved.stat()
+        signatures.append((str(resolved), stat.st_size, stat.st_mtime_ns))
+    return tuple(signatures)
+
+
+def _reviewer_worker_needs_terminal_success_normalization(reviewer: ReviewerRuntime) -> bool:
+    read_state = getattr(reviewer.worker, "read_state", None)
+    if not callable(read_state):
+        return True
+    with suppress(Exception):
+        state = read_state()
+        if isinstance(state, dict):
+            status = str(state.get("status", "") or "").strip().lower()
+            result_status = str(state.get("result_status", "") or "").strip().lower()
+            runtime_status = str(state.get("current_task_runtime_status", "") or "").strip().lower()
+            agent_state = str(state.get("agent_state", "") or "").strip().upper()
+            return not (
+                status == "succeeded"
+                and result_status == "succeeded"
+                and runtime_status == TASK_STATUS_DONE
+                and agent_state == "READY"
+            )
+    return True
+
+
+def _mark_reviewer_turn_succeeded_from_materialized_outputs(
+        reviewer: ReviewerRuntime,
+        *,
+        label: str,
+) -> None:
+    if not _reviewer_worker_needs_terminal_success_normalization(reviewer):
+        return
+    worker = reviewer.worker
+    state: dict[str, object] = {}
+    read_state = getattr(worker, "read_state", None)
+    if callable(read_state):
+        with suppress(Exception):
+            raw_state = read_state()
+            if isinstance(raw_state, dict):
+                state = raw_state
+    task_status_path_text = str(state.get("current_task_status_path", "") or "").strip()
+    if task_status_path_text:
+        with suppress(Exception):
+            write_task_status(Path(task_status_path_text).expanduser().resolve(), status=TASK_STATUS_DONE)
+    extra = {
+        "label": label,
+        "result_status": "succeeded",
+        "current_turn_id": str(state.get("current_turn_id", "") or reviewer.contract.turn_id),
+        "current_turn_phase": str(state.get("current_turn_phase", "") or REQUIREMENTS_REVIEW_TASK_NAME),
+        "current_turn_status_path": str(reviewer.review_json_path),
+        "current_task_status_path": task_status_path_text,
+        "current_task_runtime_status": TASK_STATUS_DONE,
+        "agent_started": True,
+        "agent_ready": True,
+        "agent_state": "READY",
+        "health_status": "alive",
+        "health_note": "alive",
+    }
+    record_result = getattr(worker, "_record_result", None)
+    if callable(record_result):
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        record_result(
+            CommandResult(
+                label=label,
+                command="",
+                exit_code=0,
+                raw_output=f"review artifacts materialized for {REQUIREMENTS_REVIEW_TASK_NAME}",
+                clean_output=f"review artifacts materialized for {REQUIREMENTS_REVIEW_TASK_NAME}",
+                started_at=timestamp,
+                finished_at=timestamp,
+            ),
+            status=WorkerStatus.SUCCEEDED,
+            note=f"done:{label}",
+            extra=extra,
+        )
+        return
+    write_state = getattr(worker, "_write_state", None)
+    if callable(write_state):
+        with suppress(Exception):
+            write_state(WorkerStatus.SUCCEEDED, note=f"done:{label}", extra=extra)
+
+
 def build_ba_resume_result_contract(paths: dict[str, Path]) -> TaskResultContract:
     return TaskResultContract(
         turn_id="requirements_review_ba_resume",
@@ -999,18 +1103,38 @@ def run_reviewer_turn_with_recreation(
     progress = _resolve_review_progress(progress)
     current_reviewer = reviewer
     while True:
+        baseline_satisfies_contract = _reviewer_outputs_satisfy_contract(current_reviewer)
+        baseline_signature = _reviewer_artifact_signature(current_reviewer)
         try:
             _run_reviewer_turn(
                 current_reviewer,
                 label=label,
                 prompt=prompt,
             )
+            if _reviewer_outputs_satisfy_contract(current_reviewer):
+                _mark_reviewer_turn_succeeded_from_materialized_outputs(
+                    current_reviewer,
+                    label=label,
+                )
             return current_reviewer
         except Exception as error:  # noqa: BLE001
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
             provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
             reviewer_display_name = _reviewer_artifact_agent_name(current_reviewer)
+            if (
+                    _reviewer_outputs_satisfy_contract(current_reviewer)
+                    and (
+                        not baseline_satisfies_contract
+                        or _reviewer_artifact_signature(current_reviewer) != baseline_signature
+                        or _reviewer_worker_needs_terminal_success_normalization(current_reviewer)
+                    )
+            ):
+                _mark_reviewer_turn_succeeded_from_materialized_outputs(
+                    current_reviewer,
+                    label=label,
+                )
+                return current_reviewer
             if is_turn_artifact_contract_error(error):
                 return current_reviewer
             if auth_error or provider_runtime_error:
@@ -1649,7 +1773,7 @@ def repair_reviewer_outputs(
         progress.set_phase(f"需求评审第 {round_index} 轮")
     json_pattern = f"{sanitize_requirement_name(requirement_name)}_评审记录_*.json"
     md_pattern = f"{sanitize_requirement_name(requirement_name)}_需求评审记录_*.md"
-    return repair_reviewer_round_outputs(
+    repaired_reviewers = repair_reviewer_round_outputs(
         reviewers,
         key_func=lambda reviewer: reviewer.reviewer_name,
         artifact_name_func=_reviewer_artifact_agent_name,
@@ -1680,6 +1804,13 @@ def repair_reviewer_outputs(
             progress=progress,
         ),
     )
+    for reviewer in repaired_reviewers:
+        if _reviewer_outputs_satisfy_contract(reviewer):
+            _mark_reviewer_turn_succeeded_from_materialized_outputs(
+                reviewer,
+                label=f"requirements_review_repair_verified_{reviewer.reviewer_name}_round_{round_index}",
+            )
+    return repaired_reviewers
 
 
 def _run_review_feedback_loop(

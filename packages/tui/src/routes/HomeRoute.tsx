@@ -73,8 +73,8 @@ export function HomeRoute(props: Props) {
         </box>
       </Show>
       <box borderStyle="single" paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1} flexDirection="column">
-        <text>运行中智能体</text>
-        <Show when={props.agents.length > 0} fallback={<text fg="#888888">当前没有运行中的智能体。</text>}>
+        <text>智能体状态</text>
+        <Show when={props.agents.length > 0} fallback={<text fg="#888888">当前没有可显示的智能体状态。</text>}>
           <For each={props.agents}>
             {(agent) => (
               <box flexDirection="column" marginTop={1}>
